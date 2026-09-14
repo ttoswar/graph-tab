@@ -82,12 +82,21 @@ async function loadAndRender(view, repoRef) {
         busy: true,
         detail: 'GitHub may need a moment to generate graph data for this repository.',
       });
-      source = await openRepoGraph(repoRef.owner, repoRef.repo, (count) =>
-        renderStatus(view, repoRef, `Fetching fresh commits… ${count}`, {
-          busy: true,
-          detail: 'One small request per missing commit; fetched commits are cached on this device.',
-        }),
-      );
+      // Progress may only paint while this load is still the one in flight:
+      // a tick after it settles would cover the drawn graph with the loading
+      // screen again.
+      let settled = false;
+      try {
+        source = await openRepoGraph(repoRef.owner, repoRef.repo, (count) => {
+          if (settled) return;
+          renderStatus(view, repoRef, `Fetching fresh commits… ${count}`, {
+            busy: true,
+            detail: 'One small request per missing commit; fetched commits are cached on this device.',
+          });
+        });
+      } finally {
+        settled = true;
+      }
     }
     rerender(view);
     maybeWelcome();

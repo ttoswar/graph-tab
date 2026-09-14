@@ -261,6 +261,11 @@ export async function webFreshen(owner, repo, snapshotHeads, byOid, onProgress =
       return walk(head.oid).catch(() => null);
     }),
   );
+  // A walk that hits the cap mid-wave dies with that wave's earlier fetches
+  // still in flight. Let them land before returning: otherwise their progress
+  // ticks arrive after the graph is drawn and repaint the loading screen over
+  // it, and their commits miss the cache write below.
+  await Promise.allSettled(pages.values());
   if (fetched > 0) saveCache(cache); // partial walks too: retries resume deeper
 
   const commits = [];

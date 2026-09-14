@@ -333,3 +333,35 @@ test('falls back to the embedded HTML payload when the JSON carries no commit', 
     },
   );
 });
+
+test('a walk that hits the page cap reports no progress after it returns', () => {
+  const byOid = new Map([[sha('a'), {}]]);
+  let counter = 0;
+  const fresh = () => String(counter++).padStart(40, '0');
+  return withFetch(
+    {
+      '/o/r/latest-commit/main': () => jsonResponse({ oid: sha('c') }),
+      // every commit a merge of two unseen parents: waves double until one
+      // crosses the cap with some of its fetches already in flight
+      '/o/r/commit/': (path) =>
+        new Promise((resolve) => setTimeout(resolve, 5)).then(() =>
+          commitJson({
+            oid: path.split('/').pop(),
+            parents: [fresh(), fresh()],
+            authoredDate: '2026-07-07T00:00:00Z',
+            authors: [],
+          })),
+    },
+    async () => {
+      const progress = [];
+      const { fresh: isFresh } = await webFreshen(
+        'o', 'r', [{ name: 'main', oid: sha('a') }], byOid, (count) => progress.push(count),
+      );
+      assert.equal(isFresh, false);
+      const seen = progress.length;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      // a late tick would repaint the loading screen over the drawn graph
+      assert.equal(progress.length, seen);
+    },
+  );
+});
