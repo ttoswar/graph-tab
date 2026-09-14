@@ -338,7 +338,7 @@ test('falls back to the embedded HTML payload when the JSON carries no commit', 
   );
 });
 
-test('a walk that hits the page cap reports no progress after it returns', () => {
+test('a load that spends its budget reports no progress after it returns', () => {
   const byOid = new Map([[sha('a'), {}]]);
   let counter = 0;
   const fresh = () => String(counter++).padStart(40, '0');
@@ -365,7 +365,7 @@ test('a walk that hits the page cap reports no progress after it returns', () =>
       assert.equal(progress.length, 100);
       const seen = progress.length;
       await new Promise((resolve) => setTimeout(resolve, 50));
-      // a late tick would repaint the loading screen over the drawn graph
+      // a late tick would outlive the load and paint over the drawn graph
       assert.equal(progress.length, seen);
     },
   );

@@ -39,6 +39,7 @@ test('meta fetch is retried after a transient failure', async () => {
   };
   try {
     const source = await openRepoGraph('o', 'r');
+    await source.ready;
     const { commits } = source.view();
     assert.equal(commits.length, 1);
     assert.equal(commits[0].oid, OID);
@@ -92,6 +93,7 @@ test('private repo freshens via web pages by default, never git', async () => {
   };
   try {
     const source = await openRepoGraph('o', 'r');
+    await source.ready;
     assert.equal(source.private, true);
     assert.equal(source.fresh, true);
     assert.deepEqual(source.heads, [{ name: 'main', oid: FRESH_OID }]);
@@ -134,6 +136,7 @@ test('private repo whose page endpoints fail keeps the snapshot, marked stale', 
   };
   try {
     const source = await openRepoGraph('o', 'r');
+    await source.ready;
     assert.equal(source.private, true);
     assert.equal(source.fresh, false);
     assert.deepEqual(source.tags, []);
@@ -193,6 +196,7 @@ test('private repo far behind the snapshot: one budget on open, the rest only on
   try {
     const progress = [];
     const source = await openRepoGraph('o', 'r', (count) => progress.push(count));
+    await source.ready;
     // Opening spends one budget and draws what it got, from the live head down.
     assert.equal(commitCalls, 100);
     assert.equal(progress.at(-1), 100);
@@ -220,7 +224,7 @@ test('private repo far behind the snapshot: one budget on open, the rest only on
   }
 });
 
-test('private repo hands over the snapshot before fetching missing commits', async () => {
+test('private repo comes back from the snapshot, ready once missing commits are in', async () => {
   const FRESH_OID = 'b'.repeat(40);
   const realFetch = globalThis.fetch;
   let releaseCommit;
@@ -257,23 +261,20 @@ test('private repo hands over the snapshot before fetching missing commits', asy
     throw new Error('unexpected url: ' + path);
   };
   try {
-    let snapshot = null;
+    const source = await openRepoGraph('o', 'r');
+    // handed back from the snapshot while the commit page is still out
+    assert.equal(source.updating, true);
+    assert.deepEqual(source.heads, [{ name: 'main', oid: OID }]);
+    assert.equal(source.view().commits.length, 1);
+    // a pick made meanwhile waits for the load instead of racing it
     const events = [];
-    const done = openRepoGraph('o', 'r', () => {}, (source) => {
-      snapshot = source;
-      // drawn from the snapshot while the fetch is still out
-      events.push(['snapshot', source.updating, source.heads[0].oid, source.view().commits.length]);
-    });
-    while (!snapshot) await new Promise((resolve) => setTimeout(resolve, 1));
-    // a pick made from the snapshot view waits for the load instead of racing it
-    const picked = snapshot.selectBranches(['main']).then(() => events.push(['picked', snapshot.updating]));
+    const picked = source.selectBranches(['main']).then(() => events.push(['picked', source.updating]));
     await new Promise((resolve) => setTimeout(resolve, 5));
-    assert.equal(events.length, 1);
+    assert.deepEqual(events, []);
     releaseCommit();
-    const source = await done;
+    await source.ready;
     await picked;
-    assert.equal(source, snapshot);
-    assert.deepEqual(events, [['snapshot', true, OID, 1], ['picked', false]]);
+    assert.deepEqual(events, [['picked', false]]);
     assert.equal(source.updating, false);
     assert.equal(source.fresh, true);
     assert.deepEqual(source.view().commits.map((c) => c.oid), [FRESH_OID, OID]);
@@ -308,6 +309,7 @@ test('202 (snapshot being generated) is polled through', async () => {
   };
   try {
     const source = await openRepoGraph('o', 'r');
+    await source.ready;
     assert.equal(source.view().commits.length, 1);
     assert.equal(metaCalls, 3);
   } finally {
@@ -361,6 +363,7 @@ test('chunk windows use the endpoint\'s inclusive end parameter', async () => {
   };
   try {
     const source = await openRepoGraph('o', 'r');
+    await source.ready;
     // newest window of 100 over 150 commits: [50, 150) sent as start=50&end=149
     assert.equal(chunkUrls[0].searchParams.get('start'), '50');
     assert.equal(chunkUrls[0].searchParams.get('end'), '149');
@@ -462,6 +465,7 @@ test('public freshen splices commits when the pack closes the gap', async () => 
   globalThis.fetch = publicFreshenFetch({ snapshotOid: OID, headOid: oidOf(c), packObjects: [b, c] });
   try {
     const source = await openRepoGraph('o', 'r');
+    await source.ready;
     assert.equal(source.fresh, true);
     assert.deepEqual(source.heads, [{ name: 'main', oid: oidOf(c) }]);
     assert.deepEqual(source.tags, [{ name: 'v1', oid: OID }]);
@@ -485,6 +489,7 @@ test('public freshen keeps the consistent snapshot when the pack leaves a gap', 
   globalThis.fetch = publicFreshenFetch({ snapshotOid: OID, headOid: oidOf(c), packObjects: [c] });
   try {
     const source = await openRepoGraph('o', 'r');
+    await source.ready;
     assert.equal(source.fresh, false);
     assert.deepEqual(source.heads, [{ name: 'main', oid: OID }]);
     // exact tags survive even when splicing is refused: they are ref data,
@@ -579,6 +584,7 @@ test('an unmerged branch outside the window is offered, drawn when selected', as
   });
   try {
     const source = await openRepoGraph('o', 'r');
+    await source.ready;
 
     // Default: only what the window already holds, so no extra request.
     assert.equal(source.defaultBranch, 'main');
@@ -620,6 +626,7 @@ test('a branch that reaches deeper than the fetch is drawn as a stub, not droppe
   globalThis.fetch = branchPickerFetch({ packObjects: [tip], featOid: oidOf(tip) });
   try {
     const source = await openRepoGraph('o', 'r');
+    await source.ready;
     await source.selectBranches(['main', 'feature']);
     assert.deepEqual(source.truncated, ['feature']);
     assert.deepEqual(source.view().commits.map((c) => c.oid), [oidOf(tip), OID]);
@@ -647,6 +654,7 @@ test('deselecting a branch removes its commits from the graph', async () => {
   globalThis.fetch = branchPickerFetch({ packObjects: [side], featOid: oidOf(side) });
   try {
     const source = await openRepoGraph('o', 'r');
+    await source.ready;
     await source.selectBranches(['main', 'feature']);
     assert.equal(source.view().commits.length, 2);
 
@@ -671,6 +679,7 @@ test('the default branch stays drawn, in lane 0, when only another branch is pic
   globalThis.fetch = branchPickerFetch({ packObjects: [side], featOid: oidOf(side) });
   try {
     const source = await openRepoGraph('o', 'r');
+    await source.ready;
     await source.selectBranches(['feature']);
     assert.deepEqual(source.heads.map((h) => h.name).sort(), ['feature', 'main']);
     assert.equal(source.pinnedOid, OID);

@@ -20,7 +20,7 @@
 // branch whose walk fails outright (endpoint change) keeps its
 // stale-but-consistent snapshot head while the others still freshen.
 
-const MAX_PAGES = 100;
+export const MAX_PAGES = 100;
 
 // A branch the snapshot window does not contain has to be walked from its tip
 // downwards, and nothing guarantees it ever meets the loaded history — so a
@@ -54,9 +54,12 @@ async function mapLimited(items, fn) {
 
 const JSON_HEADERS = { Accept: 'application/json', 'X-Requested-With': 'XMLHttpRequest' };
 
+// Every endpoint here rides the session cookie and must never be served stale.
+const getJson = (url) => fetch(url, { headers: JSON_HEADERS, credentials: 'include', cache: 'no-store' });
+
 // Commits are immutable, so an oid-keyed localStorage cache never goes
-// stale. It makes reopening the graph cheap and lets a branch that hit the
-// page cap get MAX_PAGES further on the next try. Insertion order doubles
+// stale. It makes reopening the graph cheap: commits fetched by an earlier
+// load cost nothing against the next one's budget. Insertion order doubles
 // as the eviction order.
 const CACHE_KEY = 'ggt-commits';
 const CACHE_MAX = 500;
@@ -90,11 +93,7 @@ function textOf(html) {
 // Exact head oid for a branch, or null when the branch no longer exists
 // (the snapshot's head list can lag deletions too).
 async function latestOid(base, ref) {
-  const response = await fetch(`${base}/latest-commit/${encodeURIComponent(ref)}`, {
-    headers: JSON_HEADERS,
-    credentials: 'include',
-    cache: 'no-store',
-  });
+  const response = await getJson(`${base}/latest-commit/${encodeURIComponent(ref)}`);
   if (response.status === 404) return null;
   if (!response.ok) throw new Error(`latest-commit: HTTP ${response.status}`);
   const { oid } = await response.json();
@@ -110,11 +109,7 @@ async function latestOid(base, ref) {
  */
 export async function webBranches(owner, repo) {
   const base = `/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
-  const response = await fetch(`${base}/refs?type=branch`, {
-    headers: JSON_HEADERS,
-    credentials: 'include',
-    cache: 'no-store',
-  });
+  const response = await getJson(`${base}/refs?type=branch`);
   if (!response.ok) throw new Error(`refs: HTTP ${response.status}`);
   const { refs } = await response.json();
   const names = Array.isArray(refs) ? refs.filter((name) => typeof name === 'string' && name) : [];
@@ -131,11 +126,7 @@ export async function webBranches(owner, repo) {
  */
 export async function webTags(owner, repo) {
   const base = `/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
-  const response = await fetch(`${base}/refs?type=tag`, {
-    headers: JSON_HEADERS,
-    credentials: 'include',
-    cache: 'no-store',
-  });
+  const response = await getJson(`${base}/refs?type=tag`);
   if (!response.ok) throw new Error(`refs: HTTP ${response.status}`);
   const { refs } = await response.json();
   if (!Array.isArray(refs)) return [];
@@ -173,11 +164,7 @@ function embeddedCommit(html, oid) {
 }
 
 async function fetchCommit(base, oid) {
-  const response = await fetch(`${base}/commit/${oid}`, {
-    headers: JSON_HEADERS,
-    credentials: 'include',
-    cache: 'no-store',
-  });
+  const response = await getJson(`${base}/commit/${oid}`);
   if (!response.ok) throw new Error(`commit: HTTP ${response.status}`);
   // The JSON route can answer 200 with a shape that carries no commit at all;
   // the HTML page still embeds one, so fall back on content rather than on the
@@ -249,9 +236,9 @@ function pager(base, onProgress) {
     return promise;
   };
   // A walk that fails mid-wave leaves that wave's other fetches in flight.
-  // Let them land before the caller draws: otherwise their progress ticks
-  // arrive after the graph is up and repaint the loading screen over it, and
-  // their commits miss the cache write.
+  // Let them land before the caller moves on: otherwise their progress ticks
+  // outlive the load that reported them, and their commits miss the cache
+  // write.
   const settle = async () => {
     await Promise.allSettled(pages.values());
     if (fetched > 0) saveCache(cache); // partial walks too: the next load resumes deeper
@@ -271,7 +258,7 @@ async function listMissing(base, startOid, reached, max) {
   const oids = [];
   let url = `${base}/commits/${startOid}`;
   while (url && oids.length < max) {
-    const response = await fetch(url, { headers: JSON_HEADERS, credentials: 'include', cache: 'no-store' });
+    const response = await getJson(url);
     if (!response.ok) break;
     const route = (await response.json())?.payload?.commitsRefRoute;
     const listed = (Array.isArray(route?.commitGroups) ? route.commitGroups : [])
@@ -291,15 +278,19 @@ async function listMissing(base, startOid, reached, max) {
   return oids;
 }
 
-// Warm the page memo for the commits below `starts`: list each, interleave
-// the lists so every branch gets its newest commits first, and fetch the
-// pages a few at a time. Whatever the budget or a failure leaves out is
-// fetched by the walk afterwards, as before.
-async function prefetch(page, base, starts, reached, max) {
-  if (starts.length === 0) return;
-  const lists = await Promise.all(
-    starts.map((oid) => listMissing(base, oid, reached, max).catch(() => [])),
-  );
+// Warm the page memo below `starts` ([{ oid, max }]). Each start's own page
+// comes first: when its parents are already reached — the usual push of a
+// commit or two — listing would only cost an extra request. Otherwise its
+// list is read, the lists are interleaved so every branch gets its newest
+// commits first, and all pages go through one limiter, so the whole prefetch
+// keeps to REF_CONCURRENCY. Whatever the budget or a failure leaves out is
+// fetched by the walk afterwards.
+async function prefetch(page, base, starts, reached) {
+  const lists = await mapLimited(starts, async ({ oid, max }) => {
+    const head = await page(oid)?.catch(() => null);
+    if (head && head.parents.every(reached)) return [];
+    return listMissing(base, oid, reached, max).catch(() => []);
+  });
   const oids = new Set();
   for (let i = 0; lists.some((list) => i < list.length); i++) {
     for (const list of lists) if (i < list.length) oids.add(list[i]);
@@ -368,13 +359,14 @@ export async function webFreshen(owner, repo, refs, byOid, onProgress = () => {}
   const known = new Set(refs.map((ref) => ref.oid).filter(Boolean));
   const reached = (oid) => byOid.has(oid) || known.has(oid);
 
-  const missing = heads.filter((head) => head.oid && !byOid.has(head.oid));
-  await Promise.all([
-    prefetch(page, base, missing.filter((head) => head.moved).map((head) => head.oid), reached, MAX_PAGES),
-    ...missing
-      .filter((head) => !head.moved && head.materialize)
-      .map((head) => prefetch(page, base, [head.oid], reached, MAX_STUB_PAGES)),
-  ]);
+  await prefetch(
+    page,
+    base,
+    heads
+      .filter((head) => head.oid && !byOid.has(head.oid) && (head.moved || head.materialize))
+      .map((head) => ({ oid: head.oid, max: head.moved ? MAX_PAGES : MAX_STUB_PAGES })),
+    reached,
+  );
 
   const chains = await Promise.all(
     heads.map((head) => {
@@ -433,7 +425,7 @@ export async function webExtend(owner, repo, starts, byOid, known = new Set()) {
   const { page, settle } = pager(base, () => {});
   const reached = (oid) => byOid.has(oid) || known.has(oid);
   try {
-    await prefetch(page, base, starts, reached, MAX_PAGES);
+    await prefetch(page, base, starts.map((oid) => ({ oid, max: MAX_PAGES })), reached);
     return await walk(page, starts, reached, Infinity);
   } finally {
     await settle();

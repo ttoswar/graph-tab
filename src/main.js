@@ -90,33 +90,21 @@ async function loadAndRender(view, repoRef) {
         busy: true,
         detail: 'GitHub may need a moment to generate graph data for this repository.',
       });
-      // A private repo hands over its snapshot first (onSnapshot) and keeps
-      // fetching missing commits behind the drawn graph. Progress then only
-      // touches the pill, and only while this load is still the current one:
-      // a tick after it settles, or after Refresh started another load, must
-      // not paint over the graph.
-      let settled = false;
-      let early = null;
-      try {
-        const loaded = await openRepoGraph(
-          repoRef.owner,
-          repoRef.repo,
-          (count) => {
-            if (!settled && early && source === early) setUpdateProgress(currentView(view), count);
-          },
-          (snapshot) => {
-            early = snapshot;
-            source = snapshot;
-            rerender(view);
-          },
-        );
-        if (early && source !== early) return; // superseded while updating
-        source = loaded;
-      } finally {
-        settled = true;
+      // A private repo comes back while its missing commits are still being
+      // fetched: draw it now, count progress on the pill, redraw once ready.
+      // Progress only counts while this load is current and updating — not
+      // after Refresh or navigation replaced it, nor for later branch picks.
+      let loading = null;
+      loading = await openRepoGraph(repoRef.owner, repoRef.repo, (count) => {
+        if (loading && source === loading && loading.updating) setUpdateProgress(currentView(view), count);
+      });
+      source = loading;
+      if (loading.updating) {
+        rerender(view);
+        await loading.ready;
+        if (source !== loading) return; // superseded while updating
+        view = currentView(view); // GitHub may have rebuilt it meanwhile
       }
-      // The view may have been rebuilt while the update ran.
-      view = currentView(view);
     }
     rerender(view);
     maybeWelcome();

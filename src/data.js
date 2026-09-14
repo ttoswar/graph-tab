@@ -24,7 +24,7 @@
 //   - parents come as [sha, time, space] tuples.
 
 import { lsRefs, fetchMissingCommits } from './gitproto.js';
-import { webFreshen, webExtend, webTags, webBranches } from './webfresh.js';
+import { webFreshen, webExtend, webTags, webBranches, MAX_PAGES } from './webfresh.js';
 import { chronoIndex, orderCommits } from './order.js';
 import { loadSelection, saveSelection, resolveSelection } from './branches.js';
 
@@ -233,11 +233,11 @@ function pageDefaultBranch() {
  * history to be drawn at all.
  *
  * Mutates `branch.oid` when a moved branch has to fall back to its snapshot
- * head. Returns { fresh, truncated }.
+ * head, and records spliced commits in `fetchedOids`. Returns { fresh }.
  */
-async function materialiseGit(owner, repo, dates, branches, byOid) {
+async function materialiseGit(owner, repo, dates, branches, byOid, fetchedOids) {
   const wants = [...new Set(branches.filter((b) => !byOid.has(b.oid)).map((b) => b.oid))];
-  if (wants.length === 0) return { fresh: true, truncated: [] };
+  if (wants.length === 0) return { fresh: true };
 
   const missing = await fetchMissingCommits(owner, repo, wants, BRANCH_DEPTH);
   const fetched = new Map(missing.map((commit) => [commit.oid, commit]));
@@ -251,7 +251,6 @@ async function materialiseGit(owner, repo, dates, branches, byOid) {
     }
   }
 
-  const truncated = [];
   let fresh = true;
   for (const branch of branches) {
     if (byOid.has(branch.oid)) continue;
@@ -267,9 +266,9 @@ async function materialiseGit(owner, repo, dates, branches, byOid) {
       fresh = false;
       continue;
     }
-    if (!closes) truncated.push(branch.name);
     for (const commit of closes ? chain : chain.slice(0, STUB_MAX)) {
       if (byOid.has(commit.oid)) continue;
+      fetchedOids.add(commit.oid);
       const known = identities.get(commit.author);
       byOid.set(commit.oid, {
         ...commit,
@@ -282,14 +281,13 @@ async function materialiseGit(owner, repo, dates, branches, byOid) {
       });
     }
   }
-  return { fresh, truncated };
+  return { fresh };
 }
 
 // Same job over GitHub's page endpoints, for a private repo:
-// git smart-HTTP ignores the web session there (see webfresh.js). Fetched
-// commits are recorded in `webOids`: where they stop short of the loaded
-// history is where "Load older commits" carries on. Returns { fresh }.
-async function materialiseWeb(owner, repo, dates, branches, byOid, webOids, onProgress) {
+// git smart-HTTP ignores the web session there (see webfresh.js).
+// Returns { fresh }.
+async function materialiseWeb(owner, repo, dates, branches, byOid, fetchedOids, onProgress) {
   const result = await webFreshen(
     owner,
     repo,
@@ -301,43 +299,44 @@ async function materialiseWeb(owner, repo, dates, branches, byOid, webOids, onPr
     byOid,
     onProgress,
   );
-  spliceWeb(dates, result.commits, byOid, webOids);
+  spliceWeb(dates, result.commits, byOid, fetchedOids);
   const live = new Map(result.heads.map((head) => [head.name, head.oid]));
   for (const branch of branches) branch.oid = live.get(branch.name);
   return { fresh: result.fresh };
 }
 
-function spliceWeb(dates, commits, byOid, webOids) {
+function spliceWeb(dates, commits, byOid, fetchedOids) {
   for (const commit of commits) {
     if (!byOid.has(commit.oid)) {
       byOid.set(commit.oid, { ...commit, idx: chronoIndex(dates, commit.date) });
-      webOids.add(commit.oid);
+      fetchedOids.add(commit.oid);
     }
   }
 }
 
-// Parents of web-fetched commits under `headOids` that nothing has loaded:
-// the points where a branch was cut short by the request budget. Snapshot
-// heads count as known — the chunk windows bring those in.
-function openParents(byOid, webOids, headOids, known) {
-  const open = new Set();
-  for (const oid of reachableFrom(byOid, headOids)) {
-    if (!webOids.has(oid)) continue;
-    for (const parent of byOid.get(oid).parents) {
-      if (!byOid.has(parent) && !known.has(parent)) open.add(parent);
-    }
+// Fetched commits whose parents nothing has loaded, mapped to those parents:
+// where a branch was cut short (request budget, stub bound). Snapshot heads
+// count as known — the chunk windows bring those in. Only fetched commits
+// can be open this way, so the scan is no bigger than what was fetched, and
+// usually finds nothing.
+function openFetched(byOid, fetchedOids, known) {
+  const open = new Map();
+  for (const oid of fetchedOids) {
+    const parents = byOid.get(oid).parents.filter((p) => !byOid.has(p) && !known.has(p));
+    if (parents.length > 0) open.set(oid, parents);
   }
-  return [...open];
+  return open;
 }
 
 /**
  * Open the graph data source for a repository.
- * @param onProgress called with a running fetch count while missing commits
- *   are pulled one request at a time (the private-repo path).
- * @param onSnapshot called with the source as soon as the snapshot is loaded,
- *   before a private repo's missing commits are fetched: that can take a
- *   while, so the graph is drawn from the snapshot first (`updating` is true
- *   until the fetch settles, and the returned promise resolves then).
+ * @param onProgress called with a running count of commit pages fetched
+ *   (the private-repo path).
+ *
+ * A private repo pays a request per missing commit, so its source is handed
+ * back as soon as the snapshot is in, to be drawn while the missing commits
+ * are fetched: `updating` is true and `ready` resolves when that settles.
+ * A public repo tops up in one git request and comes back ready.
  * @returns {Promise<{
  *   owner, repo,
  *   heads,    // [{ name, oid }] the selected branches, for chips and roots
@@ -348,6 +347,7 @@ function openParents(byOid, webOids, headOids, known) {
  *             // empty when refs could not be read (offline, endpoint changed)
  *   fresh,    // false when no top-up was available (offline, endpoint changed)
  *   updating, // true while the load is still fetching missing commits
+ *   ready,    // Promise resolving once it is not
  *   truncated,// branches drawn as a stub because their history never met the window
  *   canFetch, // false when no live ref source is available to pull a branch in
  *   private,  // true when freshness goes through the web pages (git endpoints reject the session)
@@ -357,7 +357,7 @@ function openParents(byOid, webOids, headOids, known) {
  *   loadOlder(): Promise<void>
  * }>}
  */
-export async function openRepoGraph(owner, repo, onProgress = () => {}, onSnapshot = () => {}) {
+export async function openRepoGraph(owner, repo, onProgress = () => {}) {
   const base = `/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
 
   // The ref list and the tags depend on nothing but the repository, so they
@@ -381,7 +381,7 @@ export async function openRepoGraph(owner, repo, onProgress = () => {}, onSnapsh
   const total = dates.length;
   const snapshot = focusedHeads(meta, owner, repo);
   const byOid = new Map();
-  const webOids = new Set();
+  const fetchedOids = new Set(); // commits spliced in beyond the snapshot windows
   let failedWindows = 0;
 
   // Windows are half-open [start, end), but the endpoint's end is inclusive.
@@ -445,35 +445,45 @@ export async function openRepoGraph(owner, repo, onProgress = () => {}, onSnapsh
   const isLoaded = (oid) => !!oid && byOid.has(oid);
   let selected = resolveSelection(loadSelection(owner, repo), branches, defaultBranch, isLoaded);
   async function materialise() {
-    if (!live) return { fresh: false, truncated: [] };
+    if (!live) return { fresh: false };
     const chosen = branches.filter((branch) => selected.has(branch.name));
     try {
       return priv
-        ? await materialiseWeb(owner, repo, dates, chosen, byOid, webOids, onProgress)
-        : await materialiseGit(owner, repo, dates, chosen, byOid);
+        ? await materialiseWeb(owner, repo, dates, chosen, byOid, fetchedOids, onProgress)
+        : await materialiseGit(owner, repo, dates, chosen, byOid, fetchedOids);
     } catch {
-      return { fresh: false, truncated: [] };
+      return { fresh: false };
     }
   }
 
   const selectedBranches = () => branches.filter((b) => selected.has(b.name) && b.oid);
-  const snapOids = () => new Set(branches.map((b) => b.snapOid).filter(Boolean));
-  const openTips = () =>
-    priv ? openParents(byOid, webOids, selectedBranches().map((b) => b.oid), snapOids()) : [];
+  const snapOids = new Set(snapshot.map((head) => head.oid));
 
-  // On a private repo, a branch is truncated when its web-fetched history is
-  // still open at the bottom — read off the graph itself, so it stays right
-  // after re-selection and after "Load older commits" closes a gap.
+  // Which selected branches were cut short, and the parents to carry on from.
+  // Read off the graph rather than remembered, so it stays right after
+  // re-selection and after "Load older commits" closes a gap.
+  function cutShort() {
+    const open = openFetched(byOid, fetchedOids, snapOids);
+    const names = [];
+    const tips = new Set();
+    if (open.size === 0) return { names, tips: [] };
+    for (const branch of selectedBranches()) {
+      let cut = false;
+      for (const oid of reachableFrom(byOid, [branch.oid])) {
+        for (const parent of open.get(oid) || []) {
+          cut = true;
+          tips.add(parent);
+        }
+      }
+      if (cut) names.push(branch.name);
+    }
+    return { names, tips: [...tips] };
+  }
+  // Only the page endpoints can carry a cut-short branch on (webExtend).
+  const openTips = () => (priv ? cutShort().tips : []);
+
   let fresh = false;
-  let gitTruncated = [];
   let updating = true;
-  const truncatedNow = () => {
-    if (!priv) return gitTruncated.filter((name) => selected.has(name));
-    const known = snapOids();
-    return selectedBranches()
-      .filter((b) => openParents(byOid, webOids, [b.oid], known).length > 0)
-      .map((b) => b.name);
-  };
 
   // Everything that fetches waits for the load in flight: a branch pick or
   // "Load older commits" made from the snapshot view must not race the
@@ -522,8 +532,9 @@ export async function openRepoGraph(owner, repo, onProgress = () => {}, onSnapsh
     get updating() {
       return updating;
     },
+    ready: null,
     get truncated() {
-      return truncatedNow();
+      return cutShort().names;
     },
 
     // Drawing a different set of branches only ever *adds* commits, so the
@@ -535,9 +546,7 @@ export async function openRepoGraph(owner, repo, onProgress = () => {}, onSnapsh
       selected = resolveSelection(names, branches, defaultBranch, isLoaded);
       saveSelection(owner, repo, [...selected]);
       if ([...selected].every((name) => before.has(name))) return;
-      const result = await materialise();
-      fresh = result.fresh;
-      if (!priv) gitTruncated = result.truncated;
+      ({ fresh } = await materialise());
     }),
 
     // filtered === false means no selected head landed in the loaded window,
@@ -552,7 +561,7 @@ export async function openRepoGraph(owner, repo, onProgress = () => {}, onSnapsh
 
     loaded: () => byOid.size,
     hasMore: () => loadedStart > 0 || openTips().length > 0,
-    olderCount: () => (loadedStart > 0 ? Math.min(WINDOW, loadedStart) : WINDOW),
+    olderCount: () => (loadedStart > 0 ? Math.min(WINDOW, loadedStart) : MAX_PAGES),
     failedWindows: () => failedWindows,
 
     // The only way more history is fetched after a load: the next snapshot
@@ -574,28 +583,21 @@ export async function openRepoGraph(owner, repo, onProgress = () => {}, onSnapsh
       const tips = openTips();
       if (tips.length === 0) return;
       try {
-        spliceWeb(dates, await webExtend(owner, repo, tips, byOid, snapOids()), byOid, webOids);
+        spliceWeb(dates, await webExtend(owner, repo, tips, byOid, snapOids), byOid, fetchedOids);
       } catch {
         // the branches stay open; the next click tries again
       }
     }),
   };
 
-  // Public repos top up in one git request, so they are drawn once, fresh.
-  // A private repo pays a request per missing commit: draw the snapshot now.
-  if (priv) {
+  source.ready = afterPending(async () => {
     try {
-      onSnapshot(source);
-    } catch {
-      // a drawing failure must not abandon the load
+      ({ fresh } = await materialise());
+      if (tagsPending) tags = await tagsPending;
+    } finally {
+      updating = false;
     }
-  }
-  await afterPending(async () => {
-    const first = await materialise();
-    fresh = first.fresh;
-    gitTruncated = first.truncated || [];
-    if (tagsPending) tags = await tagsPending;
   });
-  updating = false;
+  if (!priv) await source.ready;
   return source;
 }
