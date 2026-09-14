@@ -173,21 +173,23 @@ function buildShell(subtitle) {
 const dismissedBanners = new Set();
 
 // A dismissible status banner, or null when this one was already closed.
+// GitHub's own full-width flash, markup and class names as GitHub renders it
+// (close button first, floated right): primer.css styles it on every
+// repository page, so it looks and themes exactly like GitHub's banners.
+// The close has no js-flash-close — dismissal is remembered here instead.
 function banner(repoKey, text, error = false) {
   const key = `${repoKey}\n${text}`;
   if (dismissedBanners.has(key)) return null;
-  const node = el('div', 'ggt-banner' + (error ? ' ggt-banner-error' : ''));
-  node.appendChild(el('span', 'ggt-banner-text', text));
-  const close = el('button', 'ggt-banner-close');
+  const node = el('div', `flash flash-full ${error ? 'flash-error' : 'flash-warn'}`);
+  const close = el('button', 'flash-close');
   close.type = 'button';
-  close.setAttribute('aria-label', 'Dismiss');
-  close.title = 'Dismiss';
+  close.setAttribute('aria-label', 'Dismiss this message');
   close.appendChild(octicon('x'));
   close.addEventListener('click', () => {
     dismissedBanners.add(key);
     node.remove();
   });
-  node.appendChild(close);
+  node.append(close, text);
   return node;
 }
 
@@ -922,8 +924,8 @@ export function render(container, model) {
 /**
  * Centered status message inside the framed shell, in place of the graph.
  * options: { error, busy, detail, onRetry }. busy adds an indeterminate
- * progress bar (the number of pending fetches is unknown — parents are
- * discovered one commit page at a time); onRetry adds a "Try again" button.
+ * progress bar (how long GitHub takes to produce the snapshot is unknown);
+ * onRetry adds a "Try again" button.
  */
 export function renderStatus(container, repoRef, text, options = {}) {
   const { error = false, busy = false, detail = '', onRetry = null } = options;
