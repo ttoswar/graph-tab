@@ -137,7 +137,10 @@
   background: var(--bgColor-success-muted, rgba(46, 160, 67, 0.15));
 }
 .ggt-banner {
-  padding: 8px 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px 4px 16px;
   font-size: 12px;
   background: var(--bgColor-attention-muted, #fff8c5);
   border-bottom: 1px solid var(--borderColor-default, #d1d9e0);
@@ -145,6 +148,33 @@
 .ggt-banner-error {
   color: var(--fgColor-danger, #d1242f);
   background: var(--bgColor-danger-muted, #ffebe9);
+}
+.ggt-banner-text {
+  flex: 1;
+  padding: 4px 0;
+}
+/* Primer's invisible small icon button: 24px square, no chrome until hover. */
+.ggt-banner-close {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  color: var(--fgColor-muted, #59636e);
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.ggt-banner-close:hover {
+  color: var(--fgColor-default, #1f2328);
+  background: var(--control-transparent-bgColor-hover, #818b981a);
+}
+.ggt-banner-close:focus-visible {
+  outline: 2px solid var(--focus-outlineColor, #0969da);
+  outline-offset: -2px;
 }
 /* Column widths are --ggt-col-* variables set by columns.js; the header
    dividers drag them live. Grips sit on the column boundaries: author/date/

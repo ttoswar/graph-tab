@@ -167,6 +167,30 @@ function buildShell(subtitle) {
 // Applying re-renders the whole view, which rebuilds this control, so the
 // open state and the filter text live at module scope and are restored.
 
+// Banners the user closed, keyed by repository and text. The view is rebuilt
+// on every render, so this has to outlive it; a banner whose text changes
+// (another branch cut short, one more failed window) is news and shows again.
+const dismissedBanners = new Set();
+
+// A dismissible status banner, or null when this one was already closed.
+function banner(repoKey, text, error = false) {
+  const key = `${repoKey}\n${text}`;
+  if (dismissedBanners.has(key)) return null;
+  const node = el('div', 'ggt-banner' + (error ? ' ggt-banner-error' : ''));
+  node.appendChild(el('span', 'ggt-banner-text', text));
+  const close = el('button', 'ggt-banner-close');
+  close.type = 'button';
+  close.setAttribute('aria-label', 'Dismiss');
+  close.title = 'Dismiss';
+  close.appendChild(octicon('x'));
+  close.addEventListener('click', () => {
+    dismissedBanners.add(key);
+    node.remove();
+  });
+  node.appendChild(close);
+  return node;
+}
+
 const PANEL_WIDTH = 320;
 let panelOpen = false;
 let panelFilter = '';
@@ -759,20 +783,23 @@ export function render(container, model) {
   actions.appendChild(refresh);
   toolbar.appendChild(actions);
 
+  const repoKey = `${owner}/${repo}`;
+  const banners = [];
   if (!filtered) {
-    shell.appendChild(el('div', 'ggt-banner',
+    banners.push(banner(repoKey,
       'No branch head of this repository is inside the loaded window — showing the raw fork network.'));
   }
   if (truncated.length > 0) {
-    shell.appendChild(el('div', 'ggt-banner',
+    banners.push(banner(repoKey,
       `Only the newest commits of ${truncated.join(', ')} were loaded — ` +
         'the dashed line marks where history continues; "Load older commits" fetches more.'));
   }
   if (failedWindows > 0) {
-    shell.appendChild(el('div', 'ggt-banner ggt-banner-error',
+    banners.push(banner(repoKey,
       `Skipped ${failedWindows} older window${failedWindows === 1 ? '' : 's'} ` +
-        'that GitHub could not return — the graph may have gaps.'));
+        'that GitHub could not return — the graph may have gaps.', true));
   }
+  for (const node of banners) if (node) shell.appendChild(node);
 
   const { svg, width } = buildSvg(graph, headOids, commits);
   const divider = initColumns(root, { graph: width + 20, author: 150, date: 88, sha: 64 });
