@@ -7,7 +7,7 @@
 import { ensureTab, markTabSelected, markTabDeselected, repoNav, TAB_ID } from './tab.js';
 import { openRepoGraph } from './data.js';
 import { layout } from './layout.js';
-import { render, renderStatus, closeBranchPicker, markViewBusy } from './render.js';
+import { render, renderStatus, closeBranchPicker, markViewBusy, setUpdateProgress } from './render.js';
 import { maybeWelcome } from './welcome.js';
 
 const VIEW_ID = 'ggt-view';
@@ -78,6 +78,11 @@ function openGraphView() {
   loadAndRender(view, repoRef);
 }
 
+// The live view element: GitHub re-renders can replace it mid-load.
+function currentView(fallback) {
+  return document.getElementById(VIEW_ID) || fallback;
+}
+
 async function loadAndRender(view, repoRef) {
   try {
     if (!source || source.owner !== repoRef.owner || source.repo !== repoRef.repo) {
@@ -85,21 +90,33 @@ async function loadAndRender(view, repoRef) {
         busy: true,
         detail: 'GitHub may need a moment to generate graph data for this repository.',
       });
-      // Progress may only paint while this load is still the one in flight:
-      // a tick after it settles would cover the drawn graph with the loading
-      // screen again.
+      // A private repo hands over its snapshot first (onSnapshot) and keeps
+      // fetching missing commits behind the drawn graph. Progress then only
+      // touches the pill, and only while this load is still the current one:
+      // a tick after it settles, or after Refresh started another load, must
+      // not paint over the graph.
       let settled = false;
+      let early = null;
       try {
-        source = await openRepoGraph(repoRef.owner, repoRef.repo, (count) => {
-          if (settled) return;
-          renderStatus(view, repoRef, `Fetching fresh commits… ${count}`, {
-            busy: true,
-            detail: 'One small request per missing commit; fetched commits are cached on this device.',
-          });
-        });
+        const loaded = await openRepoGraph(
+          repoRef.owner,
+          repoRef.repo,
+          (count) => {
+            if (!settled && early && source === early) setUpdateProgress(currentView(view), count);
+          },
+          (snapshot) => {
+            early = snapshot;
+            source = snapshot;
+            rerender(view);
+          },
+        );
+        if (early && source !== early) return; // superseded while updating
+        source = loaded;
       } finally {
         settled = true;
       }
+      // The view may have been rebuilt while the update ran.
+      view = currentView(view);
     }
     rerender(view);
     maybeWelcome();
@@ -134,6 +151,7 @@ function rerender(view) {
     canFetch: source.canFetch,
     tags: source.tags,
     fresh: source.fresh,
+    updating: source.updating,
     filtered,
     total: source.total,
     loaded: source.loaded(),

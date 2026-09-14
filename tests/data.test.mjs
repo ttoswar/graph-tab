@@ -220,6 +220,69 @@ test('private repo far behind the snapshot: one budget on open, the rest only on
   }
 });
 
+test('private repo hands over the snapshot before fetching missing commits', async () => {
+  const FRESH_OID = 'b'.repeat(40);
+  const realFetch = globalThis.fetch;
+  let releaseCommit;
+  const commitGate = new Promise((resolve) => (releaseCommit = resolve));
+  globalThis.document = {
+    querySelector: (selector) =>
+      selector.includes('repository_public') ? { content: 'false' } : null,
+    querySelectorAll: () => [],
+  };
+  globalThis.fetch = async (url) => {
+    const path = String(url);
+    if (path.includes('/network/meta')) {
+      return jsonResponse({
+        nethash: 'h',
+        dates: ['2026-01-01'],
+        users: [{ name: 'o', repo: 'r', heads: [{ name: 'main', id: OID }] }],
+      });
+    }
+    if (path.includes('/network/chunk')) {
+      return jsonResponse({
+        commits: [{ id: OID, parents: [], author: 'X', login: 'x', date: '2026-01-01 00:00:00', message: 'old' }],
+      });
+    }
+    if (path.includes('/refs?type=branch')) return jsonResponse({ refs: ['main'] });
+    if (path.includes('/refs?type=tag')) return jsonResponse({ refs: [] });
+    if (path.includes('/latest-commit/main')) return jsonResponse({ oid: FRESH_OID });
+    if (path.includes('/commits/')) return new Response('', { status: 404 });
+    if (path.includes(`/commit/${FRESH_OID}`)) {
+      await commitGate;
+      return jsonResponse({
+        payload: { commit: { oid: FRESH_OID, parents: [OID], authoredDate: '2026-01-02T00:00:00Z', authors: [] } },
+      });
+    }
+    throw new Error('unexpected url: ' + path);
+  };
+  try {
+    let snapshot = null;
+    const events = [];
+    const done = openRepoGraph('o', 'r', () => {}, (source) => {
+      snapshot = source;
+      // drawn from the snapshot while the fetch is still out
+      events.push(['snapshot', source.updating, source.heads[0].oid, source.view().commits.length]);
+    });
+    while (!snapshot) await new Promise((resolve) => setTimeout(resolve, 1));
+    // a pick made from the snapshot view waits for the load instead of racing it
+    const picked = snapshot.selectBranches(['main']).then(() => events.push(['picked', snapshot.updating]));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(events.length, 1);
+    releaseCommit();
+    const source = await done;
+    await picked;
+    assert.equal(source, snapshot);
+    assert.deepEqual(events, [['snapshot', true, OID, 1], ['picked', false]]);
+    assert.equal(source.updating, false);
+    assert.equal(source.fresh, true);
+    assert.deepEqual(source.view().commits.map((c) => c.oid), [FRESH_OID, OID]);
+  } finally {
+    globalThis.fetch = realFetch;
+    delete globalThis.document;
+  }
+});
+
 test('202 (snapshot being generated) is polled through', async () => {
   const realFetch = globalThis.fetch;
   const realSetTimeout = globalThis.setTimeout;

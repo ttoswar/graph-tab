@@ -384,7 +384,66 @@ test('webExtend continues an open branch down to the loaded history', () => {
       const commits = await webExtend('o', 'r', [sha('d')], byOid);
       assert.deepEqual(commits.map((c) => c.oid), [sha('d'), sha('b')]);
       // stops at the loaded commit rather than fetching it
-      assert.equal(calls.length, 2);
+      assert.equal(calls.filter((c) => c.path.includes('/commit/')).length, 2);
+    },
+  );
+});
+
+test('the commit list lets a long linear run be fetched in parallel', () => {
+  // main moved 70 commits past the snapshot, one after another: without the
+  // list each parent is only known once its child has arrived.
+  const RUN = 70;
+  const oidAt = (n) => String(n).padStart(40, 'e'); // 1 is the new tip
+  const byOid = new Map([[sha('a'), {}]]);
+  const order = [...Array.from({ length: RUN }, (_, i) => oidAt(i + 1)), sha('a')];
+  let inFlight = 0;
+  let peak = 0;
+  const listPage = (from) => {
+    const page = order.slice(from, from + 35);
+    return jsonResponse({
+      payload: {
+        commitsRefRoute: {
+          commitGroups: [{ title: 'x', commits: page.map((oid) => ({ oid })) }],
+          filters: {
+            pagination: {
+              endCursor: `${oidAt(1)} ${from + page.length - 1}`,
+              hasNextPage: from + page.length < order.length,
+            },
+          },
+        },
+      },
+    });
+  };
+  return withFetch(
+    {
+      '/o/r/latest-commit/main': () => jsonResponse({ oid: oidAt(1) }),
+      [`/o/r/commits/${oidAt(1)}?after=`]: (path) =>
+        listPage(Number(decodeURIComponent(path.split('after=')[1]).split('+')[1]) + 1),
+      [`/o/r/commits/${oidAt(1)}`]: () => listPage(0),
+      '/o/r/commit/': async (path) => {
+        inFlight++;
+        peak = Math.max(peak, inFlight);
+        await new Promise((resolve) => setTimeout(resolve, 2));
+        inFlight--;
+        const n = Number(path.split('/').pop().replace(/^e+/, ''));
+        return commitJson({
+          oid: oidAt(n),
+          parents: [n === RUN ? sha('a') : oidAt(n + 1)],
+          authoredDate: '2026-07-07T00:00:00Z',
+          authors: [],
+        });
+      },
+    },
+    async (calls) => {
+      const { heads, commits, fresh } = await webFreshen('o', 'r', [{ name: 'main', oid: sha('a') }], byOid);
+      assert.equal(fresh, true);
+      assert.deepEqual(heads, [{ name: 'main', oid: oidAt(1) }]);
+      assert.equal(commits.length, RUN);
+      // 71 listed entries (70 new + the loaded base): three list pages, then
+      // every commit page once, several at a time
+      assert.equal(calls.filter((c) => c.path.includes('/commits/')).length, 3);
+      assert.equal(calls.filter((c) => c.path.includes('/commit/')).length, RUN);
+      assert.ok(peak > 1, `commit pages were fetched one at a time (peak ${peak})`);
     },
   );
 });

@@ -334,6 +334,10 @@ function openParents(byOid, webOids, headOids, known) {
  * Open the graph data source for a repository.
  * @param onProgress called with a running fetch count while missing commits
  *   are pulled one request at a time (the private-repo path).
+ * @param onSnapshot called with the source as soon as the snapshot is loaded,
+ *   before a private repo's missing commits are fetched: that can take a
+ *   while, so the graph is drawn from the snapshot first (`updating` is true
+ *   until the fetch settles, and the returned promise resolves then).
  * @returns {Promise<{
  *   owner, repo,
  *   heads,    // [{ name, oid }] the selected branches, for chips and roots
@@ -343,6 +347,7 @@ function openParents(byOid, webOids, headOids, known) {
  *   tags,     // [{ name, oid }] with annotated tags peeled to their commit;
  *             // empty when refs could not be read (offline, endpoint changed)
  *   fresh,    // false when no top-up was available (offline, endpoint changed)
+ *   updating, // true while the load is still fetching missing commits
  *   truncated,// branches drawn as a stub because their history never met the window
  *   canFetch, // false when no live ref source is available to pull a branch in
  *   private,  // true when freshness goes through the web pages (git endpoints reject the session)
@@ -352,7 +357,7 @@ function openParents(byOid, webOids, headOids, known) {
  *   loadOlder(): Promise<void>
  * }>}
  */
-export async function openRepoGraph(owner, repo, onProgress = () => {}) {
+export async function openRepoGraph(owner, repo, onProgress = () => {}, onSnapshot = () => {}) {
   const base = `/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
 
   // The ref list and the tags depend on nothing but the repository, so they
@@ -459,9 +464,9 @@ export async function openRepoGraph(owner, repo, onProgress = () => {}) {
   // On a private repo, a branch is truncated when its web-fetched history is
   // still open at the bottom — read off the graph itself, so it stays right
   // after re-selection and after "Load older commits" closes a gap.
-  const first = await materialise();
-  let fresh = first.fresh;
-  let gitTruncated = first.truncated || [];
+  let fresh = false;
+  let gitTruncated = [];
+  let updating = true;
   const truncatedNow = () => {
     if (!priv) return gitTruncated.filter((name) => selected.has(name));
     const known = snapOids();
@@ -470,9 +475,17 @@ export async function openRepoGraph(owner, repo, onProgress = () => {}) {
       .map((b) => b.name);
   };
 
-  if (tagsPending) tags = await tagsPending;
+  // Everything that fetches waits for the load in flight: a branch pick or
+  // "Load older commits" made from the snapshot view must not race the
+  // background freshen over the same branches and commits.
+  let pending = Promise.resolve();
+  const afterPending = (task) => {
+    const run = pending.then(task);
+    pending = run.catch(() => {});
+    return run;
+  };
 
-  return {
+  const source = {
     owner,
     repo,
     defaultBranch,
@@ -506,6 +519,9 @@ export async function openRepoGraph(owner, repo, onProgress = () => {}) {
     get fresh() {
       return fresh;
     },
+    get updating() {
+      return updating;
+    },
     get truncated() {
       return truncatedNow();
     },
@@ -513,7 +529,7 @@ export async function openRepoGraph(owner, repo, onProgress = () => {}) {
     // Drawing a different set of branches only ever *adds* commits, so the
     // choice is applied in place: no refetch of meta or of the window — and
     // a pure deselection needs no fetch at all, the commits are just hidden.
-    async selectBranches(names) {
+    selectBranches: (names) => afterPending(async () => {
       const before = selected;
       // Same normalisation as on open: the default branch is always in.
       selected = resolveSelection(names, branches, defaultBranch, isLoaded);
@@ -522,7 +538,7 @@ export async function openRepoGraph(owner, repo, onProgress = () => {}) {
       const result = await materialise();
       fresh = result.fresh;
       if (!priv) gitTruncated = result.truncated;
-    },
+    }),
 
     // filtered === false means no selected head landed in the loaded window,
     // so the raw fork network is shown rather than nothing.
@@ -542,7 +558,7 @@ export async function openRepoGraph(owner, repo, onProgress = () => {}) {
     // The only way more history is fetched after a load: the next snapshot
     // window, then another budget of commits below branches that were cut
     // short (the window may already have closed some of those gaps).
-    async loadOlder() {
+    loadOlder: () => afterPending(async () => {
       if (loadedStart > 0) {
         const olderEnd = loadedStart;
         const olderStart = Math.max(0, olderEnd - WINDOW);
@@ -562,6 +578,24 @@ export async function openRepoGraph(owner, repo, onProgress = () => {}) {
       } catch {
         // the branches stay open; the next click tries again
       }
-    },
+    }),
   };
+
+  // Public repos top up in one git request, so they are drawn once, fresh.
+  // A private repo pays a request per missing commit: draw the snapshot now.
+  if (priv) {
+    try {
+      onSnapshot(source);
+    } catch {
+      // a drawing failure must not abandon the load
+    }
+  }
+  await afterPending(async () => {
+    const first = await materialise();
+    fresh = first.fresh;
+    gitTruncated = first.truncated || [];
+    if (tagsPending) tags = await tagsPending;
+  });
+  updating = false;
+  return source;
 }

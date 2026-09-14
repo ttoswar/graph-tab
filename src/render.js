@@ -388,6 +388,12 @@ export function markViewBusy(container) {
   visual.appendChild(el('span', 'ggt-spinner'));
 }
 
+/** Count fetched commits on the pill while the drawn graph is being updated. */
+export function setUpdateProgress(container, count) {
+  const pill = container.querySelector('.ggt-pill');
+  if (pill) pill.textContent = `Updating… ${count}`;
+}
+
 /** Drop the overlay — the view is going away and it lives on document.body. */
 export function closeBranchPicker() {
   detachPanel?.();
@@ -733,13 +739,13 @@ function avatarFallback(commit) {
 /**
  * Render the graph view into `container` (cleared first).
  * model: { owner, repo, commits, graph, heads, tags, fresh, filtered, total,
- *   loaded, olderCount, failedWindows, hasMore, onLoadOlder, onRefresh,
+ *   updating, loaded, olderCount, failedWindows, hasMore, onLoadOlder, onRefresh,
  *   branches, selected, defaultBranch, truncated, canFetch, onSelectBranches }
  */
 export function render(container, model) {
   ensureUiStyle();
   const {
-    owner, repo, commits, graph, heads, tags, fresh, filtered, hasMore,
+    owner, repo, commits, graph, heads, tags, fresh, updating = false, filtered, hasMore,
     total, loaded, olderCount, failedWindows, onLoadOlder, onRefresh,
     branches, truncated = [],
   } = model;
@@ -768,11 +774,14 @@ export function render(container, model) {
   const actions = el('div', 'ggt-actions');
   if (branches.length > 0) actions.appendChild(buildBranchPicker(model));
   // Status only: the graph always tops the snapshot up with live heads.
-  const pill = el('span', 'ggt-pill' + (fresh ? ' ggt-pill-fresh' : ''), fresh ? 'Fresh' : 'Cached');
-  pill.title = fresh
-    ? 'Branch heads were verified live; the graph is current.'
-    : "Freshness could not be verified — GitHub's cached snapshot may lag recent pushes. " +
-      'Use Refresh to try again.';
+  const pill = el('span', 'ggt-pill' + (fresh && !updating ? ' ggt-pill-fresh' : ''),
+    updating ? 'Updating…' : fresh ? 'Fresh' : 'Cached');
+  pill.title = updating
+    ? "Showing GitHub's cached snapshot while newer commits are fetched; the graph updates when they arrive."
+    : fresh
+      ? 'Branch heads were verified live; the graph is current.'
+      : "Freshness could not be verified — GitHub's cached snapshot may lag recent pushes. " +
+        'Use Refresh to try again.';
   actions.appendChild(pill);
   const refresh = el('button', 'ggt-btn', 'Refresh');
   refresh.title = 'Reload the graph from GitHub';

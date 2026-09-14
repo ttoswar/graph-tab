@@ -32,8 +32,9 @@ const MAX_STUB_PAGES = 12;
 // so the list is capped to the newest entries the endpoint returns first.
 const MAX_TAGS = 30;
 
-// Ref resolves go to session-cookie web endpoints, where a burst of dozens of
-// parallel requests trips GitHub's abuse limiter (429s). Keep a few in flight.
+// Ref resolves and commit pages go to session-cookie web endpoints, where a
+// burst of dozens of parallel requests trips GitHub's abuse limiter (429s).
+// Keep a few in flight.
 const REF_CONCURRENCY = 5;
 
 // Map `fn` over `items` with at most REF_CONCURRENCY calls in flight,
@@ -258,6 +259,54 @@ function pager(base, onProgress) {
   return { page, settle };
 }
 
+// The commit list (GET /{owner}/{repo}/commits/{oid}, Accept: json) answers
+// 35 commits per request in history order, newest first, paginated by
+// ?after={endCursor} — but without parents, so it cannot replace the commit
+// pages. What it does give is the set of missing commits up front: listed
+// oids down to the first one already loaded. Their commit pages can then be
+// fetched in parallel instead of one parent at a time, which is what makes a
+// long linear run of new commits slow. Returns [] when the list is
+// unavailable; the walk still works without it.
+async function listMissing(base, startOid, reached, max) {
+  const oids = [];
+  let url = `${base}/commits/${startOid}`;
+  while (url && oids.length < max) {
+    const response = await fetch(url, { headers: JSON_HEADERS, credentials: 'include', cache: 'no-store' });
+    if (!response.ok) break;
+    const route = (await response.json())?.payload?.commitsRefRoute;
+    const listed = (Array.isArray(route?.commitGroups) ? route.commitGroups : [])
+      .flatMap((group) => (Array.isArray(group?.commits) ? group.commits : []))
+      .map((commit) => commit?.oid)
+      .filter((oid) => /^[0-9a-f]{40}$/.test(oid || ''));
+    if (listed.length === 0) break;
+    for (const oid of listed) {
+      if (reached(oid) || oids.length >= max) return oids;
+      oids.push(oid);
+    }
+    const { hasNextPage, endCursor } = route.filters?.pagination || {};
+    url = hasNextPage && endCursor
+      ? `${base}/commits/${startOid}?after=${encodeURIComponent(endCursor).replace(/%20/g, '+')}`
+      : null;
+  }
+  return oids;
+}
+
+// Warm the page memo for the commits below `starts`: list each, interleave
+// the lists so every branch gets its newest commits first, and fetch the
+// pages a few at a time. Whatever the budget or a failure leaves out is
+// fetched by the walk afterwards, as before.
+async function prefetch(page, base, starts, reached, max) {
+  if (starts.length === 0) return;
+  const lists = await Promise.all(
+    starts.map((oid) => listMissing(base, oid, reached, max).catch(() => [])),
+  );
+  const oids = new Set();
+  for (let i = 0; lists.some((list) => i < list.length); i++) {
+    for (const list of lists) if (i < list.length) oids.add(list[i]);
+  }
+  await mapLimited([...oids], (oid) => page(oid)?.catch(() => null));
+}
+
 // Breadth-first from `starts`, each wave of parents in parallel. `stop`
 // decides where the walk ends; `limit` caps how many commits it may collect.
 // The request budget ends it too, so a returned chain may still be open at
@@ -319,6 +368,14 @@ export async function webFreshen(owner, repo, refs, byOid, onProgress = () => {}
   const known = new Set(refs.map((ref) => ref.oid).filter(Boolean));
   const reached = (oid) => byOid.has(oid) || known.has(oid);
 
+  const missing = heads.filter((head) => head.oid && !byOid.has(head.oid));
+  await Promise.all([
+    prefetch(page, base, missing.filter((head) => head.moved).map((head) => head.oid), reached, MAX_PAGES),
+    ...missing
+      .filter((head) => !head.moved && head.materialize)
+      .map((head) => prefetch(page, base, [head.oid], reached, MAX_STUB_PAGES)),
+  ]);
+
   const chains = await Promise.all(
     heads.map((head) => {
       if (!head.oid) return null; // branch deleted; dropped below
@@ -374,8 +431,10 @@ export async function webFreshen(owner, repo, refs, byOid, onProgress = () => {}
 export async function webExtend(owner, repo, starts, byOid, known = new Set()) {
   const base = `/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
   const { page, settle } = pager(base, () => {});
+  const reached = (oid) => byOid.has(oid) || known.has(oid);
   try {
-    return await walk(page, starts, (oid) => byOid.has(oid) || known.has(oid), Infinity);
+    await prefetch(page, base, starts, reached, MAX_PAGES);
+    return await walk(page, starts, reached, Infinity);
   } finally {
     await settle();
   }
