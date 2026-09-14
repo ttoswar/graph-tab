@@ -24,7 +24,7 @@
 //   - parents come as [sha, time, space] tuples.
 
 import { lsRefs, fetchMissingCommits } from './gitproto.js';
-import { webFreshen, webTags, webBranches } from './webfresh.js';
+import { webFreshen, webExtend, webTags, webBranches } from './webfresh.js';
 import { chronoIndex, orderCommits } from './order.js';
 import { loadSelection, saveSelection, resolveSelection } from './branches.js';
 
@@ -286,8 +286,10 @@ async function materialiseGit(owner, repo, dates, branches, byOid) {
 }
 
 // Same job over GitHub's page endpoints, for a private repo:
-// git smart-HTTP ignores the web session there (see webfresh.js).
-async function materialiseWeb(owner, repo, dates, branches, byOid, onProgress) {
+// git smart-HTTP ignores the web session there (see webfresh.js). Fetched
+// commits are recorded in `webOids`: where they stop short of the loaded
+// history is where "Load older commits" carries on. Returns { fresh }.
+async function materialiseWeb(owner, repo, dates, branches, byOid, webOids, onProgress) {
   const result = await webFreshen(
     owner,
     repo,
@@ -299,14 +301,33 @@ async function materialiseWeb(owner, repo, dates, branches, byOid, onProgress) {
     byOid,
     onProgress,
   );
-  for (const commit of result.commits) {
-    if (!byOid.has(commit.oid)) {
-      byOid.set(commit.oid, { ...commit, idx: chronoIndex(dates, commit.date) });
-    }
-  }
+  spliceWeb(dates, result.commits, byOid, webOids);
   const live = new Map(result.heads.map((head) => [head.name, head.oid]));
   for (const branch of branches) branch.oid = live.get(branch.name);
-  return { fresh: result.fresh, truncated: result.truncated };
+  return { fresh: result.fresh };
+}
+
+function spliceWeb(dates, commits, byOid, webOids) {
+  for (const commit of commits) {
+    if (!byOid.has(commit.oid)) {
+      byOid.set(commit.oid, { ...commit, idx: chronoIndex(dates, commit.date) });
+      webOids.add(commit.oid);
+    }
+  }
+}
+
+// Parents of web-fetched commits under `headOids` that nothing has loaded:
+// the points where a branch was cut short by the request budget. Snapshot
+// heads count as known — the chunk windows bring those in.
+function openParents(byOid, webOids, headOids, known) {
+  const open = new Set();
+  for (const oid of reachableFrom(byOid, headOids)) {
+    if (!webOids.has(oid)) continue;
+    for (const parent of byOid.get(oid).parents) {
+      if (!byOid.has(parent) && !known.has(parent)) open.add(parent);
+    }
+  }
+  return [...open];
 }
 
 /**
@@ -355,6 +376,7 @@ export async function openRepoGraph(owner, repo, onProgress = () => {}) {
   const total = dates.length;
   const snapshot = focusedHeads(meta, owner, repo);
   const byOid = new Map();
+  const webOids = new Set();
   let failedWindows = 0;
 
   // Windows are half-open [start, end), but the endpoint's end is inclusive.
@@ -422,17 +444,33 @@ export async function openRepoGraph(owner, repo, onProgress = () => {}) {
     const chosen = branches.filter((branch) => selected.has(branch.name));
     try {
       return priv
-        ? await materialiseWeb(owner, repo, dates, chosen, byOid, onProgress)
+        ? await materialiseWeb(owner, repo, dates, chosen, byOid, webOids, onProgress)
         : await materialiseGit(owner, repo, dates, chosen, byOid);
     } catch {
       return { fresh: false, truncated: [] };
     }
   }
 
-  let { fresh, truncated } = await materialise();
-  if (tagsPending) tags = await tagsPending;
-
   const selectedBranches = () => branches.filter((b) => selected.has(b.name) && b.oid);
+  const snapOids = () => new Set(branches.map((b) => b.snapOid).filter(Boolean));
+  const openTips = () =>
+    priv ? openParents(byOid, webOids, selectedBranches().map((b) => b.oid), snapOids()) : [];
+
+  // On a private repo, a branch is truncated when its web-fetched history is
+  // still open at the bottom — read off the graph itself, so it stays right
+  // after re-selection and after "Load older commits" closes a gap.
+  const first = await materialise();
+  let fresh = first.fresh;
+  let gitTruncated = first.truncated || [];
+  const truncatedNow = () => {
+    if (!priv) return gitTruncated.filter((name) => selected.has(name));
+    const known = snapOids();
+    return selectedBranches()
+      .filter((b) => openParents(byOid, webOids, [b.oid], known).length > 0)
+      .map((b) => b.name);
+  };
+
+  if (tagsPending) tags = await tagsPending;
 
   return {
     owner,
@@ -469,7 +507,7 @@ export async function openRepoGraph(owner, repo, onProgress = () => {}) {
       return fresh;
     },
     get truncated() {
-      return truncated;
+      return truncatedNow();
     },
 
     // Drawing a different set of branches only ever *adds* commits, so the
@@ -480,13 +518,10 @@ export async function openRepoGraph(owner, repo, onProgress = () => {}) {
       // Same normalisation as on open: the default branch is always in.
       selected = resolveSelection(names, branches, defaultBranch, isLoaded);
       saveSelection(owner, repo, [...selected]);
-      if ([...selected].every((name) => before.has(name))) {
-        truncated = truncated.filter((name) => selected.has(name));
-        return;
-      }
+      if ([...selected].every((name) => before.has(name))) return;
       const result = await materialise();
       fresh = result.fresh;
-      truncated = result.truncated;
+      if (!priv) gitTruncated = result.truncated;
     },
 
     // filtered === false means no selected head landed in the loaded window,
@@ -500,22 +535,33 @@ export async function openRepoGraph(owner, repo, onProgress = () => {}) {
     },
 
     loaded: () => byOid.size,
-    hasMore: () => loadedStart > 0,
-    olderCount: () => Math.min(WINDOW, loadedStart),
+    hasMore: () => loadedStart > 0 || openTips().length > 0,
+    olderCount: () => (loadedStart > 0 ? Math.min(WINDOW, loadedStart) : WINDOW),
     failedWindows: () => failedWindows,
 
+    // The only way more history is fetched after a load: the next snapshot
+    // window, then another budget of commits below branches that were cut
+    // short (the window may already have closed some of those gaps).
     async loadOlder() {
-      if (loadedStart <= 0) return;
-      const olderEnd = loadedStart;
-      const olderStart = Math.max(0, olderEnd - WINDOW);
-      loadedStart = olderStart; // advance even on failure so a bad window can't loop
-      let ok = false;
-      try {
-        ok = await fetchWindow(olderStart, olderEnd);
-      } catch {
-        // counted below; the view keeps its consistent loaded set
+      if (loadedStart > 0) {
+        const olderEnd = loadedStart;
+        const olderStart = Math.max(0, olderEnd - WINDOW);
+        loadedStart = olderStart; // advance even on failure so a bad window can't loop
+        let ok = false;
+        try {
+          ok = await fetchWindow(olderStart, olderEnd);
+        } catch {
+          // counted below; the view keeps its consistent loaded set
+        }
+        if (!ok) failedWindows++; // surfaced as a banner, not silently skipped
       }
-      if (!ok) failedWindows++; // surfaced as a banner, not silently skipped
+      const tips = openTips();
+      if (tips.length === 0) return;
+      try {
+        spliceWeb(dates, await webExtend(owner, repo, tips, byOid, snapOids()), byOid, webOids);
+      } catch {
+        // the branches stay open; the next click tries again
+      }
     },
   };
 }

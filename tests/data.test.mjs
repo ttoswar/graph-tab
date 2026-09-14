@@ -144,6 +144,82 @@ test('private repo whose page endpoints fail keeps the snapshot, marked stale', 
   }
 });
 
+test('private repo far behind the snapshot: one budget on open, the rest only on "load older"', async () => {
+  // main moved 150 commits past the snapshot — more than one load may fetch.
+  const chainOid = (n) => String(n).padStart(40, 'f'); // n = 1 is the new tip
+  const GAP = 150;
+  const realFetch = globalThis.fetch;
+  let commitCalls = 0;
+  globalThis.document = {
+    querySelector: (selector) =>
+      selector.includes('repository_public') ? { content: 'false' } : null,
+    querySelectorAll: () => [],
+  };
+  globalThis.fetch = async (url) => {
+    const path = String(url);
+    if (path.includes('/network/meta')) {
+      return jsonResponse({
+        nethash: 'h',
+        dates: ['2026-01-01'],
+        users: [{ name: 'o', repo: 'r', heads: [{ name: 'main', id: OID }] }],
+      });
+    }
+    if (path.includes('/network/chunk')) {
+      return jsonResponse({
+        commits: [{ id: OID, parents: [], author: 'X', login: 'x', date: '2026-01-01 00:00:00', message: 'old' }],
+      });
+    }
+    if (path.includes('/refs?type=branch')) return jsonResponse({ refs: ['main'] });
+    if (path.includes('/refs?type=tag')) return jsonResponse({ refs: [] });
+    if (path.includes('/latest-commit/main')) return jsonResponse({ oid: chainOid(1) });
+    const match = /\/commit\/([0-9a-f]{40})$/.exec(path);
+    if (match) {
+      commitCalls++;
+      const n = Number(match[1].replace(/^f+/, ''));
+      return jsonResponse({
+        payload: {
+          commit: {
+            oid: match[1],
+            parents: [n === GAP ? OID : chainOid(n + 1)],
+            authoredDate: new Date(Date.UTC(2026, 5, 1) - n * 60000).toISOString(),
+            shortMessageMarkdown: `c${n}`,
+            authors: [],
+          },
+        },
+      });
+    }
+    throw new Error('unexpected url: ' + path);
+  };
+  try {
+    const progress = [];
+    const source = await openRepoGraph('o', 'r', (count) => progress.push(count));
+    // Opening spends one budget and draws what it got, from the live head down.
+    assert.equal(commitCalls, 100);
+    assert.equal(progress.at(-1), 100);
+    assert.equal(source.fresh, true);
+    assert.deepEqual(source.heads, [{ name: 'main', oid: chainOid(1) }]);
+    assert.deepEqual(source.truncated, ['main']);
+    assert.equal(source.hasMore(), true);
+    const shown = source.view().commits.map((c) => c.oid);
+    assert.equal(shown.length, 100);
+    assert.equal(shown[0], chainOid(1));
+
+    // Nothing further is fetched until the user asks for it.
+    source.view();
+    assert.equal(commitCalls, 100);
+
+    await source.loadOlder();
+    assert.deepEqual(source.truncated, []);
+    assert.equal(source.hasMore(), false);
+    const all = source.view().commits.map((c) => c.oid);
+    assert.equal(all.length, GAP + 1);
+    assert.equal(all.at(-1), OID);
+  } finally {
+    globalThis.fetch = realFetch;
+    delete globalThis.document;
+  }
+});
+
 test('202 (snapshot being generated) is polled through', async () => {
   const realFetch = globalThis.fetch;
   const realSetTimeout = globalThis.setTimeout;

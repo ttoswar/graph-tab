@@ -40,7 +40,9 @@ Works on Chrome and Edge, Firefox is WiP.
   so the graph walks `/latest-commit/{ref}` and `/commit/{oid}` (as JSON via
   `Accept`) instead, and resolves tags through `/refs?type=tag` +
   `/latest-commit/{tag}`. That costs one request per missing commit (and per
-  tag, capped), so the first load of a busy private repo is slower.
+  tag, capped), so a load spends at most 100 of them: a branch that moved
+  further is drawn from its live head down to the last commit fetched, with a
+  dashed tail, and "Load older commits" fetches the next 100 below it.
   Fetched commits are immutable, so they are cached (localStorage, keyed by
   oid) and never re-fetched.
 - **Branches** (`src/branches.js`, `src/render.js`, `src/octicon.js`): which branches the

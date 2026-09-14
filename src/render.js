@@ -765,8 +765,8 @@ export function render(container, model) {
   }
   if (truncated.length > 0) {
     shell.appendChild(el('div', 'ggt-banner',
-      `Only the tip of ${truncated.join(', ')} could be loaded — ` +
-        'the dashed line marks where each branch continues below the graph.'));
+      `Only the newest commits of ${truncated.join(', ')} were loaded — ` +
+        'the dashed line marks where history continues; "Load older commits" fetches more.'));
   }
   if (failedWindows > 0) {
     shell.appendChild(el('div', 'ggt-banner ggt-banner-error',

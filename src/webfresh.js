@@ -14,10 +14,11 @@
 //      react-app.embeddedData JSON — kept as a parsing fallback)
 //
 // Parents only come from the commit route, so this still costs one request
-// per missing commit — hence MAX_PAGES. Only branches whose head moved are
-// walked, each independently: a branch that
-// fails (cap hit, endpoint change) keeps its stale-but-consistent snapshot
-// head while the others still freshen.
+// per missing commit — hence MAX_PAGES, a hard budget per load. Only branches
+// whose head moved are walked: a branch that moved further than the budget
+// reaches is drawn from its live head down to the last commit fetched, and a
+// branch whose walk fails outright (endpoint change) keeps its
+// stale-but-consistent snapshot head while the others still freshen.
 
 const MAX_PAGES = 100;
 
@@ -217,13 +218,78 @@ async function fetchCommit(base, oid) {
   };
 }
 
+// Commit pages over one request budget. `page` resolves a commit from the
+// cache (free) or the network, and returns null without fetching once
+// MAX_PAGES network requests have been spent: running out stops a walk where
+// it is rather than failing it, so whatever was collected can still be drawn.
+// Memoised, so parallel walks meeting at a merge fetch a page once.
+function pager(base, onProgress) {
+  const cache = loadCache();
+  const pages = new Map();
+  let fetched = 0;
+  let done = 0;
+  const page = (oid) => {
+    if (pages.has(oid)) return pages.get(oid);
+    let promise;
+    if (cache[oid]) {
+      promise = Promise.resolve({ ...cache[oid], date: new Date(cache[oid].date) });
+    } else {
+      if (fetched >= MAX_PAGES) return null;
+      fetched++;
+      promise = fetchCommit(base, oid).then((commit) => {
+        cache[oid] = { ...commit, date: commit.date.getTime() };
+        onProgress(++done);
+        return commit;
+      });
+      // marks the rejection handled for walks that die before awaiting it
+      promise.catch(() => {});
+    }
+    pages.set(oid, promise);
+    return promise;
+  };
+  // A walk that fails mid-wave leaves that wave's other fetches in flight.
+  // Let them land before the caller draws: otherwise their progress ticks
+  // arrive after the graph is up and repaint the loading screen over it, and
+  // their commits miss the cache write.
+  const settle = async () => {
+    await Promise.allSettled(pages.values());
+    if (fetched > 0) saveCache(cache); // partial walks too: the next load resumes deeper
+  };
+  return { page, settle };
+}
+
+// Breadth-first from `starts`, each wave of parents in parallel. `stop`
+// decides where the walk ends; `limit` caps how many commits it may collect.
+// The request budget ends it too, so a returned chain may still be open at
+// the bottom — callers read that off the parents.
+async function walk(page, starts, stop, limit) {
+  const chain = [];
+  const seen = new Set();
+  let wave = starts;
+  while (wave.length > 0 && chain.length < limit) {
+    const oids = wave
+      .filter((oid) => !stop(oid) && !seen.has(oid))
+      .slice(0, limit - chain.length);
+    for (const oid of oids) seen.add(oid);
+    const commits = await Promise.all(oids.map(page).filter(Boolean));
+    chain.push(...commits);
+    wave = commits.flatMap((commit) => commit.parents);
+  }
+  return chain;
+}
+
 /**
  * Exact branch heads plus the commits the snapshot is missing:
- * { heads, commits, fresh, truncated }. Commits carry real GitHub identities
+ * { heads, commits, fresh }. Commits carry real GitHub identities
  * (login/avatar straight from the payload — better than the git path's
  * name→login guessing). fresh is false when some moved branch could not be
- * walked completely and was reverted to its snapshot head; truncated lists
- * the branches drawn as a stub because their history never met the window.
+ * walked at all and was reverted to its snapshot head.
+ *
+ * One load spends at most MAX_PAGES requests, however far the branches have
+ * moved: a branch whose new commits do not reach the loaded history within
+ * that budget keeps its live head and the newest commits that were fetched,
+ * open at the bottom. Fetching further is the user's call (webExtend, behind
+ * "Load older commits"), never something a load does on its own.
  *
  * `refs` is [{ name, oid, materialize }]. Without `materialize` a branch is
  * only walked when its head moved past the snapshot — the freshness job, and
@@ -242,63 +308,15 @@ export async function webFreshen(owner, repo, refs, byOid, onProgress = () => {}
       snapOid: ref.oid,
       materialize: !!ref.materialize,
       oid,
-      // Recorded now: the fallback below rewrites `oid`, and the splice
-      // loop still needs to know which branches had actually moved.
       moved: !!ref.oid && !!oid && oid !== ref.oid,
     };
   });
 
-  // Shared memo so parallel branch walks meeting at a merge fetch a page
-  // once. Cache hits are free: only network fetches count toward the cap.
-  // The stray .catch marks rejections as handled for walks that die before
-  // awaiting them.
-  const cache = loadCache();
-  const pages = new Map();
-  let fetched = 0;
-  let done = 0;
-  const page = (oid) => {
-    if (pages.has(oid)) return pages.get(oid);
-    let promise;
-    if (cache[oid]) {
-      promise = Promise.resolve({ ...cache[oid], date: new Date(cache[oid].date) });
-    } else {
-      if (fetched >= MAX_PAGES) throw new Error('webfresh: page cap exceeded');
-      fetched++;
-      promise = fetchCommit(base, oid).then((commit) => {
-        cache[oid] = { ...commit, date: commit.date.getTime() };
-        onProgress(++done);
-        return commit;
-      });
-      promise.catch(() => {});
-    }
-    pages.set(oid, promise);
-    return promise;
-  };
+  const { page, settle } = pager(base, onProgress);
 
   // A walk ends at loaded snapshot commits, or at any snapshot head: heads
   // below the loaded window are still known history, not missing commits.
   const known = new Set(refs.map((ref) => ref.oid).filter(Boolean));
-
-  // Breadth-first from a moved head, each wave of parents in parallel.
-  // `stop` decides where the walk ends; `limit` caps how many commits it may
-  // collect (Infinity for the freshness walks, which have to close the gap
-  // or be discarded entirely).
-  async function walk(startOid, stop, limit) {
-    const chain = [];
-    const seen = new Set();
-    let wave = [startOid];
-    while (wave.length > 0 && chain.length < limit) {
-      const oids = wave
-        .filter((oid) => !stop(oid) && !seen.has(oid))
-        .slice(0, limit - chain.length);
-      for (const oid of oids) seen.add(oid);
-      const commits = await Promise.all(oids.map(page));
-      chain.push(...commits);
-      wave = commits.flatMap((commit) => commit.parents);
-    }
-    return chain;
-  }
-
   const reached = (oid) => byOid.has(oid) || known.has(oid);
 
   const chains = await Promise.all(
@@ -306,41 +324,38 @@ export async function webFreshen(owner, repo, refs, byOid, onProgress = () => {}
       if (!head.oid) return null; // branch deleted; dropped below
       if (byOid.has(head.oid)) return []; // already drawn
       if (head.moved) {
-        // Moved past the snapshot: the gap has to close, or the branch keeps
-        // its stale-but-consistent head.
-        return walk(head.oid, reached, Infinity).catch(() => null);
+        // Empty means the budget was gone before the head itself was fetched
+        // (unless the head is a snapshot head, which needs no fetch).
+        return walk(page, [head.oid], reached, Infinity)
+          .then((chain) => (chain.length > 0 || known.has(head.oid) ? chain : null))
+          .catch(() => null);
       }
       if (!head.materialize) return []; // unmoved and not asked for: nothing to do
       // Outside the window and explicitly selected: a bounded stub is the
-      // point, so a walk that runs out of budget still counts.
-      return walk(head.oid, (oid) => oid !== head.oid && reached(oid), MAX_STUB_PAGES)
+      // point, so a walk that fails part-way still counts.
+      return walk(page, [head.oid], (oid) => oid !== head.oid && reached(oid), MAX_STUB_PAGES)
         .catch(() => [])
         .then((chain) => (chain.length > 0 ? chain : null));
     }),
   );
-  if (fetched > 0) saveCache(cache); // partial walks too: retries resume deeper
+  await settle();
 
   const commits = [];
   const spliced = new Set();
-  const truncated = [];
   let fresh = true;
   heads.forEach((head, i) => {
-    if (chains[i]) {
-      for (const commit of chains[i]) {
+    const chain = chains[i];
+    if (chain) {
+      for (const commit of chain) {
         if (!spliced.has(commit.oid)) {
           spliced.add(commit.oid);
           commits.push(commit);
         }
       }
-      if (head.materialize && !head.moved && chains[i].length > 0) {
-        const drawn = new Set(chains[i].map((commit) => commit.oid));
-        const open = chains[i].some((commit) =>
-          commit.parents.some((parent) => !drawn.has(parent) && !reached(parent)),
-        );
-        if (open) truncated.push(head.name);
-      }
     } else if (head.oid) {
-      head.oid = head.snapOid; // walk failed: stale but consistent
+      // Nothing of the live head could be fetched: stale but consistent.
+      // (A materialised branch has no snapshot head and drops out.)
+      head.oid = head.snapOid;
       fresh = false;
     }
   });
@@ -348,6 +363,20 @@ export async function webFreshen(owner, repo, refs, byOid, onProgress = () => {}
     heads: heads.filter((head) => head.oid).map((head) => ({ name: head.name, oid: head.oid })),
     commits,
     fresh,
-    truncated,
   };
+}
+
+/**
+ * Continue branches that a budgeted walk left open: fetch downwards from the
+ * given parent oids until the history reaches `byOid` or one of the `known`
+ * snapshot heads, within one more MAX_PAGES budget. Returns the commits.
+ */
+export async function webExtend(owner, repo, starts, byOid, known = new Set()) {
+  const base = `/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+  const { page, settle } = pager(base, () => {});
+  try {
+    return await walk(page, starts, (oid) => byOid.has(oid) || known.has(oid), Infinity);
+  } finally {
+    await settle();
+  }
 }
