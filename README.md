@@ -144,6 +144,20 @@ Layout is a pure function, so the graph geometry (lanes, colors, merge joins,
 coalesced straight runs, dangling tails) is asserted directly; network code
 is tested by stubbing `globalThis.fetch`.
 
+## Contributing
+
+Pull requests are welcome. The preferred flow:
+
+- **Branch off `main`** for each change; do not send your fork's `main` as
+  the PR branch.
+- **Keep the branch linear.** Rebase onto `main` when it moves instead of
+  merging `main` into your branch; a PR should be a clean series of commits
+  with no merge commits inside it.
+- **One concern per commit**, with a message that says why, not just what.
+  Run the tests before pushing.
+- PRs are landed with a **merge commit** (no fast-forward, no squash), so
+  the branch's commits stay as they were reviewed and the merge itself
+  marks where the change came in.
 
 ## Deployment
 
