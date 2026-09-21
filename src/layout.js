@@ -44,6 +44,14 @@ export function layout(commits, options = {}) {
   }
 
   const findLane = (sha) => lanes.findIndex((lane) => lane !== null && lane.sha === sha);
+  // A lane that is actually drawing towards `sha`. The reserved lane is not
+  // one: it draws nothing until its commit is reached, so a merge edge that
+  // joined it would end in mid-air one row below the merge and the pinned
+  // node would appear rows later with nothing coming into it. Such an edge
+  // gets a lane of its own instead, which bends into lane 0 when the pinned
+  // commit arrives — exactly as a first-parent edge to it already does.
+  const findOpenLane = (sha) =>
+    lanes.findIndex((lane) => lane !== null && lane.sha === sha && !lane.reserved);
   const freeLane = () => {
     // Lane 0 stays the pinned branch's for the whole graph, even after its
     // history ends, so the leftmost line never turns into something else.
@@ -86,7 +94,7 @@ export function layout(commits, options = {}) {
         }
       }
       for (const join of joins) {
-        const target = findLane(join.sha);
+        const target = findOpenLane(join.sha);
         const x2 = join.sha === commit.oid ? x : target;
         segments.push({ x1: join.fromX, y1, x2, y2: row, color: lanes[target].color });
       }
@@ -110,7 +118,7 @@ export function layout(commits, options = {}) {
     // that sha when one is open, otherwise start a new lane from this node.
     for (let p = 1; p < parents.length; p++) {
       const sha = parents[p];
-      if (findLane(sha) !== -1) {
+      if (findOpenLane(sha) !== -1) {
         joins.push({ fromX: x, sha });
       } else {
         const k = freeLane();
