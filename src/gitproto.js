@@ -84,23 +84,28 @@ export async function lsRefs(owner, repo) {
  * [{ oid, parents, author, date, message }]. `depth` bounds the walk from
  * each want, so this cannot pull a whole history.
  *
- * Deliberately no `have` lines. "have X" promises the server that X *and all
- * of its ancestors* are present, and the loaded set here is a window into
- * GitHub's network array, not an ancestor-closed set: passing the snapshot's
- * branch heads (which is what this used to do, and which included the very
- * oids being asked for) made the server negotiate everything away and answer
- * with an empty pack, so no branch outside the window was ever pulled in.
- * `filter tree:0` keeps the cost of skipping negotiation to commit objects
- * only, a few hundred bytes each.
+ * `haves` is optional and must be used with care: "have X" promises the
+ * server that X *and all of its ancestors* are present, and the loaded set
+ * here is a window into GitHub's network array, not an ancestor-closed set.
+ * It is right for one job only — a branch whose snapshot head is loaded and
+ * whose live head moved past it: `have <snapshot head>` stops the pack
+ * exactly where known history begins, so the new commits are bridged
+ * however many there are (up to `depth`), and nothing older is fetched.
+ * Passing every snapshot head (what this used to do) included the very oids
+ * being asked for, made the server negotiate everything away, and no branch
+ * outside the window was ever pulled in; such wants go without haves and
+ * with a small depth. `filter tree:0` keeps the cost to commit objects only,
+ * a few hundred bytes each.
  *
  * `deepen` counts depth along *every* parent of a merge, so it grows fast on
  * merge-heavy histories (git/git: 239 objects at 8, 3199 at 25). Callers keep
- * it small and cut the result down themselves.
+ * it small and cut the result down themselves, unless haves bound it.
  */
-export async function fetchMissingCommits(owner, repo, wants, depth) {
+export async function fetchMissingCommits(owner, repo, wants, depth, haves = []) {
   const lines = [pktLine('command=fetch\n'), '0001',
     pktLine('filter tree:0\n'), pktLine('no-progress\n'), pktLine(`deepen ${depth}\n`)];
   for (const oid of wants) lines.push(pktLine(`want ${oid}\n`));
+  for (const oid of haves) lines.push(pktLine(`have ${oid}\n`));
   lines.push(pktLine('done\n'), '0000');
   const data = await uploadPack(owner, repo, lines);
 

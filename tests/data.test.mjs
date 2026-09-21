@@ -476,6 +476,51 @@ test('public freshen splices commits when the pack closes the gap', async () => 
   }
 });
 
+test('public freshen bridges a branch that moved further than the stub depth', async () => {
+  // main moved 20 commits past the snapshot — more than the shallow depth a
+  // branch outside the window gets. The gap is negotiated with `have`, so
+  // every new commit is spliced and the graph is fresh, not reverted.
+  const GAP = 20;
+  const chain = [];
+  let parent = OID;
+  for (let n = 1; n <= GAP; n++) {
+    const bytes = commitBytes({ parents: [parent], message: `new ${n}\n` });
+    chain.push(bytes);
+    parent = oidOf(bytes);
+  }
+  const tipOid = parent;
+  const realFetch = globalThis.fetch;
+  const bodies = [];
+  globalThis.document = {
+    querySelector: (selector) =>
+      selector.includes('repository_public') ? { content: 'true' } : null,
+  };
+  const inner = publicFreshenFetch({ snapshotOid: OID, headOid: tipOid, packObjects: chain });
+  globalThis.fetch = async (url, init = {}) => {
+    if (String(url).includes('.git/git-upload-pack') && String(init.body).includes('command=fetch')) {
+      bodies.push(String(init.body));
+    }
+    return inner(url, init);
+  };
+  try {
+    const source = await openRepoGraph('o', 'r');
+    await source.ready;
+    assert.equal(bodies.length, 1);
+    assert.ok(bodies[0].includes(`want ${tipOid}\n`));
+    assert.ok(bodies[0].includes(`have ${OID}\n`), 'a moved branch negotiates against its snapshot head');
+    assert.ok(bodies[0].includes('deepen 100\n'), 'the walk is bounded by the window, not the stub depth');
+    assert.equal(source.fresh, true);
+    assert.deepEqual(source.heads, [{ name: 'main', oid: tipOid }]);
+    const shown = source.view().commits.map((commit) => commit.oid);
+    assert.equal(shown.length, GAP + 1);
+    assert.equal(shown[0], tipOid);
+    assert.equal(shown.at(-1), OID);
+  } finally {
+    globalThis.fetch = realFetch;
+    delete globalThis.document;
+  }
+});
+
 test('public freshen keeps the consistent snapshot when the pack leaves a gap', async () => {
   const b = commitBytes({ parents: [OID], message: 'mid\n' });
   const c = commitBytes({ parents: [oidOf(b)], message: 'tip\n' });

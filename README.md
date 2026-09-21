@@ -57,10 +57,13 @@ Works on Chrome and Edge, Firefox is WiP.
   the `defaultBranch` the repo page embeds) plus every branch the window
   already holds — the old behaviour, at the old cost. The default branch is
   always drawn and cannot be unticked, so lane 0 is always it. Ticking more
-  branches fetches just their tips (`want` + a small `deepen`, deliberately **no**
+  branches fetches just their tips (`want` + a small `deepen`, with **no**
   `have` lines: the loaded window is a slice of the network array, not an
   ancestor-closed set, so promising it as "have" makes the server negotiate
-  everything away and answer with an empty pack). A branch that reaches back
+  everything away and answer with an empty pack). A branch that merely moved
+  past a snapshot head the window holds is the one case where `have` is
+  right — `have <snapshot head>` stops the pack exactly where known history
+  begins — so its gap is bridged in full, not cut at the stub depth. A branch that reaches back
   further than the fetch is drawn as a stub with a dashed tail rather than
   hidden, the way `git log --graph --all` shows a shallow or unrelated
   history. Choices are remembered per repository. The picker is GitHub's

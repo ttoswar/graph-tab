@@ -34,7 +34,9 @@ const WINDOW = 100;
 // for history it never negotiated away. `deepen` counts depth along every
 // parent of a merge, so it is kept small and the result is cut down per
 // branch afterwards: enough commits to show where the branch is and how it
-// has been developing, not its whole history.
+// has been developing, not its whole history. A branch that merely *moved*
+// past a loaded snapshot head is a different case — its gap is negotiated
+// with `have`, bounded by WINDOW, so this depth never limits freshness.
 const BRANCH_DEPTH = 8;
 const STUB_MAX = 12;
 
@@ -236,11 +238,25 @@ function pageDefaultBranch() {
  * head, and records spliced commits in `fetchedOids`. Returns { fresh }.
  */
 async function materialiseGit(owner, repo, dates, branches, byOid, fetchedOids) {
-  const wants = [...new Set(branches.filter((b) => !byOid.has(b.oid)).map((b) => b.oid))];
-  if (wants.length === 0) return { fresh: true };
+  const absent = branches.filter((branch) => !byOid.has(branch.oid));
+  if (absent.length === 0) return { fresh: true };
 
-  const missing = await fetchMissingCommits(owner, repo, wants, BRANCH_DEPTH);
-  const fetched = new Map(missing.map((commit) => [commit.oid, commit]));
+  // Two different asks. A branch whose snapshot head is loaded has *moved*:
+  // everything between its live head and that snapshot head is wanted, and
+  // `have <snapshot head>` lets the server stop exactly there, so the gap is
+  // bridged however many commits it is (up to WINDOW). A branch with no
+  // loaded snapshot head is simply outside the window: nothing is known to
+  // negotiate against, so it is fetched shallow and drawn as a stub.
+  const moved = absent.filter((branch) => byOid.has(branch.snapOid));
+  const outside = absent.filter((branch) => !byOid.has(branch.snapOid));
+  const oids = (list) => [...new Set(list.map((branch) => branch.oid))];
+  const packs = await Promise.all([
+    moved.length > 0
+      ? fetchMissingCommits(owner, repo, oids(moved), WINDOW, oids(moved.map((b) => ({ oid: b.snapOid }))))
+      : [],
+    outside.length > 0 ? fetchMissingCommits(owner, repo, oids(outside), BRANCH_DEPTH) : [],
+  ]);
+  const fetched = new Map(packs.flat().map((commit) => [commit.oid, commit]));
 
   // git objects carry name+email, not GitHub identities; recover login and
   // avatar from snapshot commits by the same author, else avatar by email.
