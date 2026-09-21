@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Graph Tab for GitHub",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Adds a Graph tab to GitHub repositories. Renders the commit graph without requiring any permissions.",
   "icons": {
     "16": "icon16.png",
