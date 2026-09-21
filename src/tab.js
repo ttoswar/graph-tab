@@ -4,6 +4,8 @@
 // logged-in React nav alike) without hardcoding churn-prone class names.
 // Our own CSS (.ggt-nav*) only kicks in if there is no sibling to copy from.
 
+import { octicon } from './octicon.js';
+
 export const TAB_ID = 'ggt-tab';
 
 const NAV_SELECTORS = [
@@ -11,12 +13,6 @@ const NAV_SELECTORS = [
   'ul[class*="UnderlineItemList"]',
   'nav[class*="LocalNavigation"] ul',
 ];
-
-const ICON_PATH =
-  'M9.5 3.25a2.25 2.25 0 1 1 3 2.122V6A2.5 2.5 0 0 1 10 8.5H6a1 1 0 0 0-1 1v1.128a2.251 ' +
-  '2.251 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.5 0v1.836A2.493 2.493 0 0 1 6 7h4a1 1 0 0 0 ' +
-  '1-1v-.628A2.25 2.25 0 0 1 9.5 3.25Zm-6 0a.75.75 0 1 0 1.5 0 .75.75 0 0 0-1.5 0Zm8.25-.75a' +
-  '.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5ZM4.25 12a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Z';
 
 export function repoNav() {
   for (const selector of NAV_SELECTORS) {
@@ -87,21 +83,10 @@ export function ensureTab(onOpen) {
     onOpen();
   });
 
-  const icon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-  icon.setAttribute('viewBox', '0 0 16 16');
-  icon.setAttribute('width', '16');
-  icon.setAttribute('height', '16');
-  icon.setAttribute('aria-hidden', 'true');
-  icon.setAttribute('focusable', 'false');
-  icon.setAttribute('data-component', 'Octicon');
-  icon.setAttribute('fill', 'currentColor');
-  icon.setAttribute('display', 'inline-block');
-  icon.setAttribute('overflow', 'visible');
-  icon.setAttribute('style', 'vertical-align:text-bottom');
+  // octicon() already carries GitHub's own presentation attributes; the
+  // sibling's classes go on top (copyClasses drops its octicon-* names).
+  const icon = octicon('git-branch');
   copyClasses(siblingLink?.querySelector('svg'), icon);
-  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-  path.setAttribute('d', ICON_PATH);
-  icon.appendChild(path);
 
   // Primer's current UnderlineNav styles its icon through this component
   // slot. Without the wrapper the icon inherits the link's darker color and

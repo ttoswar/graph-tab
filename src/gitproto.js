@@ -46,22 +46,29 @@ async function uploadPack(owner, repo, lines) {
 }
 
 /**
- * Exact branch heads and tags, straight from the git server:
- * { heads: [{ name, oid }], tags: [{ name, oid }] }. `peel` makes the server
- * append "peeled:<oid>" to annotated-tag lines, so every tag oid here is the
- * commit it points at, never the tag object.
+ * Exact branch heads, tags and the default branch, straight from the git
+ * server: { heads: [{ name, oid }], tags: [{ name, oid }], head }.
+ * `peel` makes the server append "peeled:<oid>" to annotated-tag lines, so
+ * every tag oid here is the commit it points at, never the tag object;
+ * `symrefs` makes it append "symref-target:refs/heads/<name>" to HEAD, which
+ * is the repository's default branch (the one the graph always draws).
  */
 export async function lsRefs(owner, repo) {
   const data = await uploadPack(owner, repo, [
-    pktLine('command=ls-refs\n'), '0001', pktLine('peel\n'),
+    pktLine('command=ls-refs\n'), '0001', pktLine('peel\n'), pktLine('symrefs\n'),
+    pktLine('ref-prefix HEAD\n'),
     pktLine('ref-prefix refs/heads/\n'), pktLine('ref-prefix refs/tags/\n'), '0000',
   ]);
   const heads = [];
   const tags = [];
+  let head = '';
   for (const line of pktLines(data)) {
     const [oid, name, ...attrs] = decoder.decode(line).trim().split(' ');
     if (!name || !/^[0-9a-f]{40}$/.test(oid)) continue;
-    if (name.startsWith('refs/heads/')) {
+    if (name === 'HEAD') {
+      const target = attrs.find((attr) => attr.startsWith('symref-target:'))?.slice('symref-target:'.length);
+      if (target && target.startsWith('refs/heads/')) head = target.slice('refs/heads/'.length);
+    } else if (name.startsWith('refs/heads/')) {
       heads.push({ name: name.slice('refs/heads/'.length), oid });
     } else if (name.startsWith('refs/tags/')) {
       const peeled = attrs.find((attr) => attr.startsWith('peeled:'))?.slice('peeled:'.length);
@@ -69,16 +76,32 @@ export async function lsRefs(owner, repo) {
       tags.push({ name: name.slice('refs/tags/'.length), oid: target });
     }
   }
-  return { heads, tags };
+  return { heads, tags, head };
 }
 
 /**
- * Fetch the commits reachable from `wants` but not from `haves`, as parsed
- * commit objects: [{ oid, parents, author, date, message }]. `depth` bounds
- * the walk from each want, so an empty/useless `haves` (brand-new repo,
- * long-diverged snapshot) cannot pull the whole history.
+ * Fetch the commits at the tip of `wants`, as parsed commit objects:
+ * [{ oid, parents, author, date, message }]. `depth` bounds the walk from
+ * each want, so this cannot pull a whole history.
+ *
+ * `haves` is optional and must be used with care: "have X" promises the
+ * server that X *and all of its ancestors* are present, and the loaded set
+ * here is a window into GitHub's network array, not an ancestor-closed set.
+ * It is right for one job only — a branch whose snapshot head is loaded and
+ * whose live head moved past it: `have <snapshot head>` stops the pack
+ * exactly where known history begins, so the new commits are bridged
+ * however many there are (up to `depth`), and nothing older is fetched.
+ * Passing every snapshot head (what this used to do) included the very oids
+ * being asked for, made the server negotiate everything away, and no branch
+ * outside the window was ever pulled in; such wants go without haves and
+ * with a small depth. `filter tree:0` keeps the cost to commit objects only,
+ * a few hundred bytes each.
+ *
+ * `deepen` counts depth along *every* parent of a merge, so it grows fast on
+ * merge-heavy histories (git/git: 239 objects at 8, 3199 at 25). Callers keep
+ * it small and cut the result down themselves, unless haves bound it.
  */
-export async function fetchMissingCommits(owner, repo, wants, haves, depth) {
+export async function fetchMissingCommits(owner, repo, wants, depth, haves = []) {
   const lines = [pktLine('command=fetch\n'), '0001',
     pktLine('filter tree:0\n'), pktLine('no-progress\n'), pktLine(`deepen ${depth}\n`)];
   for (const oid of wants) lines.push(pktLine(`want ${oid}\n`));

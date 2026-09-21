@@ -14,19 +14,27 @@
 //      react-app.embeddedData JSON — kept as a parsing fallback)
 //
 // Parents only come from the commit route, so this still costs one request
-// per missing commit — hence the opt-in in data.js and MAX_PAGES. Only
-// branches whose head moved are walked, each independently: a branch that
-// fails (cap hit, endpoint change) keeps its stale-but-consistent snapshot
-// head while the others still freshen.
+// per missing commit — hence MAX_PAGES, a hard budget per load. Only branches
+// whose head moved are walked: a branch that moved further than the budget
+// reaches is drawn from its live head down to the last commit fetched, and a
+// branch whose walk fails outright (endpoint change) keeps its
+// stale-but-consistent snapshot head while the others still freshen.
 
-const MAX_PAGES = 100;
+export const MAX_PAGES = 100;
+
+// A branch the snapshot window does not contain has to be walked from its tip
+// downwards, and nothing guarantees it ever meets the loaded history — so a
+// single such branch gets a small budget and is drawn as a stub with a dashed
+// tail rather than being allowed to spend the whole page allowance.
+const MAX_STUB_PAGES = 12;
 
 // Tags cost one /latest-commit request each (names come bare from /refs),
 // so the list is capped to the newest entries the endpoint returns first.
 const MAX_TAGS = 30;
 
-// Ref resolves go to session-cookie web endpoints, where a burst of dozens of
-// parallel requests trips GitHub's abuse limiter (429s). Keep a few in flight.
+// Ref resolves and commit pages go to session-cookie web endpoints, where a
+// burst of dozens of parallel requests trips GitHub's abuse limiter (429s).
+// Keep a few in flight.
 const REF_CONCURRENCY = 5;
 
 // Map `fn` over `items` with at most REF_CONCURRENCY calls in flight,
@@ -46,9 +54,12 @@ async function mapLimited(items, fn) {
 
 const JSON_HEADERS = { Accept: 'application/json', 'X-Requested-With': 'XMLHttpRequest' };
 
+// Every endpoint here rides the session cookie and must never be served stale.
+const getJson = (url) => fetch(url, { headers: JSON_HEADERS, credentials: 'include', cache: 'no-store' });
+
 // Commits are immutable, so an oid-keyed localStorage cache never goes
-// stale. It makes reopening the graph cheap and lets a branch that hit the
-// page cap get MAX_PAGES further on the next try. Insertion order doubles
+// stale. It makes reopening the graph cheap: commits fetched by an earlier
+// load cost nothing against the next one's budget. Insertion order doubles
 // as the eviction order.
 const CACHE_KEY = 'ggt-commits';
 const CACHE_MAX = 500;
@@ -82,16 +93,27 @@ function textOf(html) {
 // Exact head oid for a branch, or null when the branch no longer exists
 // (the snapshot's head list can lag deletions too).
 async function latestOid(base, ref) {
-  const response = await fetch(`${base}/latest-commit/${encodeURIComponent(ref)}`, {
-    headers: JSON_HEADERS,
-    credentials: 'include',
-    cache: 'no-store',
-  });
+  const response = await getJson(`${base}/latest-commit/${encodeURIComponent(ref)}`);
   if (response.status === 404) return null;
   if (!response.ok) throw new Error(`latest-commit: HTTP ${response.status}`);
   const { oid } = await response.json();
   if (!/^[0-9a-f]{40}$/.test(oid || '')) throw new Error('latest-commit: no oid');
   return oid;
+}
+
+/**
+ * Every branch of a private repo over the same session-cookie web endpoint:
+ * { names, head }. `/refs?type=branch` answers with bare names and lists the
+ * repository's default branch first (checked against the `defaultBranch` the
+ * repo page embeds), which is the one branch the graph always draws.
+ */
+export async function webBranches(owner, repo) {
+  const base = `/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+  const response = await getJson(`${base}/refs?type=branch`);
+  if (!response.ok) throw new Error(`refs: HTTP ${response.status}`);
+  const { refs } = await response.json();
+  const names = Array.isArray(refs) ? refs.filter((name) => typeof name === 'string' && name) : [];
+  return { names, head: names[0] || '' };
 }
 
 /**
@@ -104,11 +126,7 @@ async function latestOid(base, ref) {
  */
 export async function webTags(owner, repo) {
   const base = `/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
-  const response = await fetch(`${base}/refs?type=tag`, {
-    headers: JSON_HEADERS,
-    credentials: 'include',
-    cache: 'no-store',
-  });
+  const response = await getJson(`${base}/refs?type=tag`);
   if (!response.ok) throw new Error(`refs: HTTP ${response.status}`);
   const { refs } = await response.json();
   if (!Array.isArray(refs)) return [];
@@ -146,11 +164,7 @@ function embeddedCommit(html, oid) {
 }
 
 async function fetchCommit(base, oid) {
-  const response = await fetch(`${base}/commit/${oid}`, {
-    headers: JSON_HEADERS,
-    credentials: 'include',
-    cache: 'no-store',
-  });
+  const response = await getJson(`${base}/commit/${oid}`);
   if (!response.ok) throw new Error(`commit: HTTP ${response.status}`);
   // The JSON route can answer 200 with a shape that carries no commit at all;
   // the HTML page still embeds one, so fall back on content rather than on the
@@ -192,26 +206,12 @@ async function fetchCommit(base, oid) {
   };
 }
 
-/**
- * Exact branch heads plus the commits the snapshot is missing:
- * { heads, commits, fresh }. Commits carry real GitHub identities
- * (login/avatar straight from the payload — better than the git path's
- * name→login guessing). fresh is false when some moved branch could not be
- * walked completely and was reverted to its snapshot head.
- * onProgress is called with a running count of network fetches.
- */
-export async function webFreshen(owner, repo, snapshotHeads, byOid, onProgress = () => {}) {
-  const base = `/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
-  const heads = await mapLimited(snapshotHeads, async (head) => ({
-    name: head.name,
-    snapOid: head.oid,
-    oid: await latestOid(base, head.name),
-  }));
-
-  // Shared memo so parallel branch walks meeting at a merge fetch a page
-  // once. Cache hits are free: only network fetches count toward the cap.
-  // The stray .catch marks rejections as handled for walks that die before
-  // awaiting them.
+// Commit pages over one request budget. `page` resolves a commit from the
+// cache (free) or the network, and returns null without fetching once
+// MAX_PAGES network requests have been spent: running out stops a walk where
+// it is rather than failing it, so whatever was collected can still be drawn.
+// Memoised, so parallel walks meeting at a merge fetch a page once.
+function pager(base, onProgress) {
   const cache = loadCache();
   const pages = new Map();
   let fetched = 0;
@@ -222,60 +222,189 @@ export async function webFreshen(owner, repo, snapshotHeads, byOid, onProgress =
     if (cache[oid]) {
       promise = Promise.resolve({ ...cache[oid], date: new Date(cache[oid].date) });
     } else {
-      if (fetched >= MAX_PAGES) throw new Error('webfresh: page cap exceeded');
+      if (fetched >= MAX_PAGES) return null;
       fetched++;
       promise = fetchCommit(base, oid).then((commit) => {
         cache[oid] = { ...commit, date: commit.date.getTime() };
         onProgress(++done);
         return commit;
       });
+      // marks the rejection handled for walks that die before awaiting it
       promise.catch(() => {});
     }
     pages.set(oid, promise);
     return promise;
   };
+  // A walk that fails mid-wave leaves that wave's other fetches in flight.
+  // Let them land before the caller moves on: otherwise their progress ticks
+  // outlive the load that reported them, and their commits miss the cache
+  // write.
+  const settle = async () => {
+    await Promise.allSettled(pages.values());
+    if (fetched > 0) saveCache(cache); // partial walks too: the next load resumes deeper
+  };
+  return { page, settle };
+}
+
+// The commit list (GET /{owner}/{repo}/commits/{oid}, Accept: json) answers
+// 35 commits per request in history order, newest first, paginated by
+// ?after={endCursor} — but without parents, so it cannot replace the commit
+// pages. What it does give is the set of missing commits up front: listed
+// oids down to the first one already loaded. Their commit pages can then be
+// fetched in parallel instead of one parent at a time, which is what makes a
+// long linear run of new commits slow. Returns [] when the list is
+// unavailable; the walk still works without it.
+async function listMissing(base, startOid, reached, max) {
+  const oids = [];
+  let url = `${base}/commits/${startOid}`;
+  while (url && oids.length < max) {
+    const response = await getJson(url);
+    if (!response.ok) break;
+    const route = (await response.json())?.payload?.commitsRefRoute;
+    const listed = (Array.isArray(route?.commitGroups) ? route.commitGroups : [])
+      .flatMap((group) => (Array.isArray(group?.commits) ? group.commits : []))
+      .map((commit) => commit?.oid)
+      .filter((oid) => /^[0-9a-f]{40}$/.test(oid || ''));
+    if (listed.length === 0) break;
+    for (const oid of listed) {
+      if (reached(oid) || oids.length >= max) return oids;
+      oids.push(oid);
+    }
+    const { hasNextPage, endCursor } = route.filters?.pagination || {};
+    url = hasNextPage && endCursor
+      ? `${base}/commits/${startOid}?after=${encodeURIComponent(endCursor).replace(/%20/g, '+')}`
+      : null;
+  }
+  return oids;
+}
+
+// Warm the page memo below `starts` ([{ oid, max }]). Each start's own page
+// comes first: when its parents are already reached — the usual push of a
+// commit or two — listing would only cost an extra request. Otherwise its
+// list is read, the lists are interleaved so every branch gets its newest
+// commits first, and all pages go through one limiter, so the whole prefetch
+// keeps to REF_CONCURRENCY. Whatever the budget or a failure leaves out is
+// fetched by the walk afterwards.
+async function prefetch(page, base, starts, reached) {
+  const lists = await mapLimited(starts, async ({ oid, max }) => {
+    const head = await page(oid)?.catch(() => null);
+    if (head && head.parents.every(reached)) return [];
+    return listMissing(base, oid, reached, max).catch(() => []);
+  });
+  const oids = new Set();
+  for (let i = 0; lists.some((list) => i < list.length); i++) {
+    for (const list of lists) if (i < list.length) oids.add(list[i]);
+  }
+  await mapLimited([...oids], (oid) => page(oid)?.catch(() => null));
+}
+
+// Breadth-first from `starts`, each wave of parents in parallel. `stop`
+// decides where the walk ends; `limit` caps how many commits it may collect.
+// The request budget ends it too, so a returned chain may still be open at
+// the bottom — callers read that off the parents.
+async function walk(page, starts, stop, limit) {
+  const chain = [];
+  const seen = new Set();
+  let wave = starts;
+  while (wave.length > 0 && chain.length < limit) {
+    const oids = wave
+      .filter((oid) => !stop(oid) && !seen.has(oid))
+      .slice(0, limit - chain.length);
+    for (const oid of oids) seen.add(oid);
+    const commits = await Promise.all(oids.map(page).filter(Boolean));
+    chain.push(...commits);
+    wave = commits.flatMap((commit) => commit.parents);
+  }
+  return chain;
+}
+
+/**
+ * Exact branch heads plus the commits the snapshot is missing:
+ * { heads, commits, fresh }. Commits carry real GitHub identities
+ * (login/avatar straight from the payload — better than the git path's
+ * name→login guessing). fresh is false when some moved branch could not be
+ * walked at all and was reverted to its snapshot head.
+ *
+ * One load spends at most MAX_PAGES requests, however far the branches have
+ * moved: a branch whose new commits do not reach the loaded history within
+ * that budget keeps its live head and the newest commits that were fetched,
+ * open at the bottom. Fetching further is the user's call (webExtend, behind
+ * "Load older commits"), never something a load does on its own.
+ *
+ * `refs` is [{ name, oid, materialize }]. Without `materialize` a branch is
+ * only walked when its head moved past the snapshot — the freshness job, and
+ * the cheap default. With it, a branch whose tip is outside the loaded window
+ * is pulled in as well (bounded by MAX_STUB_PAGES), which is what makes a
+ * branch the user ticked in the header picker actually appear in the graph.
+ *
+ * onProgress is called with a running count of network fetches.
+ */
+export async function webFreshen(owner, repo, refs, byOid, onProgress = () => {}) {
+  const base = `/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+  const heads = await mapLimited(refs, async (ref) => {
+    const oid = await latestOid(base, ref.name);
+    return {
+      name: ref.name,
+      snapOid: ref.oid,
+      materialize: !!ref.materialize,
+      oid,
+      moved: !!ref.oid && !!oid && oid !== ref.oid,
+    };
+  });
+
+  const { page, settle } = pager(base, onProgress);
 
   // A walk ends at loaded snapshot commits, or at any snapshot head: heads
   // below the loaded window are still known history, not missing commits.
-  const known = new Set(snapshotHeads.map((head) => head.oid));
+  const known = new Set(refs.map((ref) => ref.oid).filter(Boolean));
+  const reached = (oid) => byOid.has(oid) || known.has(oid);
 
-  // Breadth-first from a moved head, each wave of parents in parallel.
-  async function walk(startOid) {
-    const chain = [];
-    const seen = new Set();
-    let wave = [startOid];
-    while (wave.length > 0) {
-      const oids = wave.filter((oid) => !byOid.has(oid) && !known.has(oid) && !seen.has(oid));
-      for (const oid of oids) seen.add(oid);
-      const commits = await Promise.all(oids.map(page));
-      chain.push(...commits);
-      wave = commits.flatMap((commit) => commit.parents);
-    }
-    return chain;
-  }
+  await prefetch(
+    page,
+    base,
+    heads
+      .filter((head) => head.oid && !byOid.has(head.oid) && (head.moved || head.materialize))
+      .map((head) => ({ oid: head.oid, max: head.moved ? MAX_PAGES : MAX_STUB_PAGES })),
+    reached,
+  );
 
   const chains = await Promise.all(
     heads.map((head) => {
       if (!head.oid) return null; // branch deleted; dropped below
-      if (head.oid === head.snapOid || byOid.has(head.oid)) return []; // nothing missing
-      return walk(head.oid).catch(() => null);
+      if (byOid.has(head.oid)) return []; // already drawn
+      if (head.moved) {
+        // Empty means the budget was gone before the head itself was fetched
+        // (unless the head is a snapshot head, which needs no fetch).
+        return walk(page, [head.oid], reached, Infinity)
+          .then((chain) => (chain.length > 0 || known.has(head.oid) ? chain : null))
+          .catch(() => null);
+      }
+      if (!head.materialize) return []; // unmoved and not asked for: nothing to do
+      // Outside the window and explicitly selected: a bounded stub is the
+      // point, so a walk that fails part-way still counts.
+      return walk(page, [head.oid], (oid) => oid !== head.oid && reached(oid), MAX_STUB_PAGES)
+        .catch(() => [])
+        .then((chain) => (chain.length > 0 ? chain : null));
     }),
   );
-  if (fetched > 0) saveCache(cache); // partial walks too: retries resume deeper
+  await settle();
 
   const commits = [];
   const spliced = new Set();
   let fresh = true;
   heads.forEach((head, i) => {
-    if (chains[i]) {
-      for (const commit of chains[i]) {
+    const chain = chains[i];
+    if (chain) {
+      for (const commit of chain) {
         if (!spliced.has(commit.oid)) {
           spliced.add(commit.oid);
           commits.push(commit);
         }
       }
     } else if (head.oid) {
-      head.oid = head.snapOid; // walk failed: stale but consistent
+      // Nothing of the live head could be fetched: stale but consistent.
+      // (A materialised branch has no snapshot head and drops out.)
+      head.oid = head.snapOid;
       fresh = false;
     }
   });
@@ -284,4 +413,21 @@ export async function webFreshen(owner, repo, snapshotHeads, byOid, onProgress =
     commits,
     fresh,
   };
+}
+
+/**
+ * Continue branches that a budgeted walk left open: fetch downwards from the
+ * given parent oids until the history reaches `byOid` or one of the `known`
+ * snapshot heads, within one more MAX_PAGES budget. Returns the commits.
+ */
+export async function webExtend(owner, repo, starts, byOid, known = new Set()) {
+  const base = `/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+  const { page, settle } = pager(base, () => {});
+  const reached = (oid) => byOid.has(oid) || known.has(oid);
+  try {
+    await prefetch(page, base, starts.map((oid) => ({ oid, max: MAX_PAGES })), reached);
+    return await walk(page, starts, reached, Infinity);
+  } finally {
+    await settle();
+  }
 }

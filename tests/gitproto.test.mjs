@@ -102,6 +102,7 @@ test('parsePack: plain, ref-delta, and ofs-delta commits', async () => {
 test('lsRefs parses pkt-line ref advertisement', async () => {
   const pkt = (s) => `${(s.length + 4).toString(16).padStart(4, '0')}${s}`;
   const body =
+    pkt('df7f2341aedd9e596c3709b41b0a25606f4e2298 HEAD symref-target:refs/heads/main\n') +
     pkt('df7f2341aedd9e596c3709b41b0a25606f4e2298 refs/heads/main\n') +
     pkt('fdbe98a9262f0545c8cbbfdbfa08a5a49bcacf08 refs/heads/feat/a b\n') + // symref hint after space is ignored
     pkt(`${'1'.repeat(40)} refs/tags/v1.0.0 peeled:${'2'.repeat(40)}\n`) + // annotated: peeled commit wins
@@ -113,10 +114,13 @@ test('lsRefs parses pkt-line ref advertisement', async () => {
     assert.match(init.body, /command=ls-refs/);
     assert.match(init.body, /peel\n/);
     assert.match(init.body, /ref-prefix refs\/tags\//);
+    assert.match(init.body, /symrefs\n/);
     return new Response(Buffer.from(body));
   };
   try {
-    const { heads, tags } = await lsRefs('o', 'r');
+    const { heads, tags, head } = await lsRefs('o', 'r');
+    // HEAD's symref target is the default branch, and never a branch itself
+    assert.equal(head, 'main');
     assert.deepEqual(heads, [
       { name: 'main', oid: 'df7f2341aedd9e596c3709b41b0a25606f4e2298' },
       { name: 'feat/a', oid: 'fdbe98a9262f0545c8cbbfdbfa08a5a49bcacf08' },

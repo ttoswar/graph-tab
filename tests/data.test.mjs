@@ -39,6 +39,7 @@ test('meta fetch is retried after a transient failure', async () => {
   };
   try {
     const source = await openRepoGraph('o', 'r');
+    await source.ready;
     const { commits } = source.view();
     assert.equal(commits.length, 1);
     assert.equal(commits[0].oid, OID);
@@ -49,15 +50,12 @@ test('meta fetch is retried after a transient failure', async () => {
   }
 });
 
-test('private repo with the opt-in freshens via web pages, never git', async () => {
+test('private repo freshens via web pages by default, never git', async () => {
   const FRESH_OID = 'b'.repeat(40);
   const realFetch = globalThis.fetch;
   globalThis.document = {
     querySelector: (selector) =>
       selector.includes('repository_public') ? { content: 'false' } : null,
-  };
-  globalThis.localStorage = {
-    getItem: (key) => (key === 'ggt-private-fresh' ? '1' : null),
   };
   globalThis.fetch = async (url) => {
     const path = String(url);
@@ -74,6 +72,7 @@ test('private repo with the opt-in freshens via web pages, never git', async () 
         commits: [{ id: OID, parents: [], author: 'X', login: 'x', date: '2026-01-01 00:00:00', message: 'old' }],
       });
     }
+    if (path.includes('/refs?type=branch')) return jsonResponse({ refs: ['main'] });
     if (path.includes('/refs?type=tag')) return jsonResponse({ refs: ['v1'] });
     if (path.includes('/latest-commit/main')) return jsonResponse({ oid: FRESH_OID });
     if (path.includes('/latest-commit/v1')) return jsonResponse({ oid: OID });
@@ -94,6 +93,7 @@ test('private repo with the opt-in freshens via web pages, never git', async () 
   };
   try {
     const source = await openRepoGraph('o', 'r');
+    await source.ready;
     assert.equal(source.private, true);
     assert.equal(source.fresh, true);
     assert.deepEqual(source.heads, [{ name: 'main', oid: FRESH_OID }]);
@@ -108,7 +108,7 @@ test('private repo with the opt-in freshens via web pages, never git', async () 
   }
 });
 
-test('private repo without the opt-in keeps the snapshot, marked stale', async () => {
+test('private repo whose page endpoints fail keeps the snapshot, marked stale', async () => {
   const realFetch = globalThis.fetch;
   globalThis.document = {
     querySelector: (selector) =>
@@ -116,8 +116,9 @@ test('private repo without the opt-in keeps the snapshot, marked stale', async (
   };
   globalThis.fetch = async (url) => {
     const path = String(url);
-    if (path.includes('.git/') || path.includes('/latest-commit/') || path.includes('/refs?')) {
-      throw new Error('freshen fetch without opt-in: ' + path);
+    if (path.includes('.git/')) throw new Error('git endpoint hit on a private repo');
+    if (path.includes('/latest-commit/') || path.includes('/refs?') || path.includes('/branches')) {
+      throw new Error('endpoint down: ' + path);
     }
     if (path.includes('/network/meta')) {
       return jsonResponse({
@@ -135,10 +136,148 @@ test('private repo without the opt-in keeps the snapshot, marked stale', async (
   };
   try {
     const source = await openRepoGraph('o', 'r');
+    await source.ready;
     assert.equal(source.private, true);
     assert.equal(source.fresh, false);
     assert.deepEqual(source.tags, []);
     assert.equal(source.view().commits.length, 1);
+  } finally {
+    globalThis.fetch = realFetch;
+    delete globalThis.document;
+  }
+});
+
+test('private repo far behind the snapshot: one budget on open, the rest only on "load older"', async () => {
+  // main moved 150 commits past the snapshot — more than one load may fetch.
+  const chainOid = (n) => String(n).padStart(40, 'f'); // n = 1 is the new tip
+  const GAP = 150;
+  const realFetch = globalThis.fetch;
+  let commitCalls = 0;
+  globalThis.document = {
+    querySelector: (selector) =>
+      selector.includes('repository_public') ? { content: 'false' } : null,
+    querySelectorAll: () => [],
+  };
+  globalThis.fetch = async (url) => {
+    const path = String(url);
+    if (path.includes('/network/meta')) {
+      return jsonResponse({
+        nethash: 'h',
+        dates: ['2026-01-01'],
+        users: [{ name: 'o', repo: 'r', heads: [{ name: 'main', id: OID }] }],
+      });
+    }
+    if (path.includes('/network/chunk')) {
+      return jsonResponse({
+        commits: [{ id: OID, parents: [], author: 'X', login: 'x', date: '2026-01-01 00:00:00', message: 'old' }],
+      });
+    }
+    if (path.includes('/refs?type=branch')) return jsonResponse({ refs: ['main'] });
+    if (path.includes('/refs?type=tag')) return jsonResponse({ refs: [] });
+    if (path.includes('/latest-commit/main')) return jsonResponse({ oid: chainOid(1) });
+    const match = /\/commit\/([0-9a-f]{40})$/.exec(path);
+    if (match) {
+      commitCalls++;
+      const n = Number(match[1].replace(/^f+/, ''));
+      return jsonResponse({
+        payload: {
+          commit: {
+            oid: match[1],
+            parents: [n === GAP ? OID : chainOid(n + 1)],
+            authoredDate: new Date(Date.UTC(2026, 5, 1) - n * 60000).toISOString(),
+            shortMessageMarkdown: `c${n}`,
+            authors: [],
+          },
+        },
+      });
+    }
+    throw new Error('unexpected url: ' + path);
+  };
+  try {
+    const progress = [];
+    const source = await openRepoGraph('o', 'r', (count) => progress.push(count));
+    await source.ready;
+    // Opening spends one budget and draws what it got, from the live head down.
+    assert.equal(commitCalls, 100);
+    assert.equal(progress.at(-1), 100);
+    assert.equal(source.fresh, true);
+    assert.deepEqual(source.heads, [{ name: 'main', oid: chainOid(1) }]);
+    assert.deepEqual(source.truncated, ['main']);
+    assert.equal(source.hasMore(), true);
+    const shown = source.view().commits.map((c) => c.oid);
+    assert.equal(shown.length, 100);
+    assert.equal(shown[0], chainOid(1));
+
+    // Nothing further is fetched until the user asks for it.
+    source.view();
+    assert.equal(commitCalls, 100);
+
+    await source.loadOlder();
+    assert.deepEqual(source.truncated, []);
+    assert.equal(source.hasMore(), false);
+    const all = source.view().commits.map((c) => c.oid);
+    assert.equal(all.length, GAP + 1);
+    assert.equal(all.at(-1), OID);
+  } finally {
+    globalThis.fetch = realFetch;
+    delete globalThis.document;
+  }
+});
+
+test('private repo comes back from the snapshot, ready once missing commits are in', async () => {
+  const FRESH_OID = 'b'.repeat(40);
+  const realFetch = globalThis.fetch;
+  let releaseCommit;
+  const commitGate = new Promise((resolve) => (releaseCommit = resolve));
+  globalThis.document = {
+    querySelector: (selector) =>
+      selector.includes('repository_public') ? { content: 'false' } : null,
+    querySelectorAll: () => [],
+  };
+  globalThis.fetch = async (url) => {
+    const path = String(url);
+    if (path.includes('/network/meta')) {
+      return jsonResponse({
+        nethash: 'h',
+        dates: ['2026-01-01'],
+        users: [{ name: 'o', repo: 'r', heads: [{ name: 'main', id: OID }] }],
+      });
+    }
+    if (path.includes('/network/chunk')) {
+      return jsonResponse({
+        commits: [{ id: OID, parents: [], author: 'X', login: 'x', date: '2026-01-01 00:00:00', message: 'old' }],
+      });
+    }
+    if (path.includes('/refs?type=branch')) return jsonResponse({ refs: ['main'] });
+    if (path.includes('/refs?type=tag')) return jsonResponse({ refs: [] });
+    if (path.includes('/latest-commit/main')) return jsonResponse({ oid: FRESH_OID });
+    if (path.includes('/commits/')) return new Response('', { status: 404 });
+    if (path.includes(`/commit/${FRESH_OID}`)) {
+      await commitGate;
+      return jsonResponse({
+        payload: { commit: { oid: FRESH_OID, parents: [OID], authoredDate: '2026-01-02T00:00:00Z', authors: [] } },
+      });
+    }
+    throw new Error('unexpected url: ' + path);
+  };
+  try {
+    const source = await openRepoGraph('o', 'r');
+    // handed back from the snapshot while the commit page is still out
+    assert.equal(source.updating, true);
+    assert.deepEqual(source.heads, [{ name: 'main', oid: OID }]);
+    assert.equal(source.view().commits.length, 1);
+    // a pick made meanwhile waits for the load instead of racing it
+    const events = [];
+    const picked = source.selectBranches(['main']).then(() => events.push(['picked', source.updating]));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.deepEqual(events, []);
+    releaseCommit();
+    await source.ready;
+    await picked;
+    assert.deepEqual(events, [['picked', false]]);
+    assert.equal(source.updating, false);
+    assert.equal(source.fresh, true);
+    assert.deepEqual(source.view().commits.map((c) => c.oid), [FRESH_OID, OID]);
   } finally {
     globalThis.fetch = realFetch;
     delete globalThis.document;
@@ -170,6 +309,7 @@ test('202 (snapshot being generated) is polled through', async () => {
   };
   try {
     const source = await openRepoGraph('o', 'r');
+    await source.ready;
     assert.equal(source.view().commits.length, 1);
     assert.equal(metaCalls, 3);
   } finally {
@@ -183,8 +323,9 @@ test('persistent 202 surfaces a "still generating" error, not "no data"', async 
   const realSetTimeout = globalThis.setTimeout;
   globalThis.setTimeout = (fn) => realSetTimeout(fn, 0);
   let metaCalls = 0;
-  globalThis.fetch = async () => {
-    metaCalls++;
+  globalThis.fetch = async (url) => {
+    // The ref list and tags ride alongside; only the snapshot is polled.
+    if (String(url).includes('/network/meta')) metaCalls++;
     return new Response('', { status: 202 });
   };
   try {
@@ -222,6 +363,7 @@ test('chunk windows use the endpoint\'s inclusive end parameter', async () => {
   };
   try {
     const source = await openRepoGraph('o', 'r');
+    await source.ready;
     // newest window of 100 over 150 commits: [50, 150) sent as start=50&end=149
     assert.equal(chunkUrls[0].searchParams.get('start'), '50');
     assert.equal(chunkUrls[0].searchParams.get('end'), '149');
@@ -323,10 +465,56 @@ test('public freshen splices commits when the pack closes the gap', async () => 
   globalThis.fetch = publicFreshenFetch({ snapshotOid: OID, headOid: oidOf(c), packObjects: [b, c] });
   try {
     const source = await openRepoGraph('o', 'r');
+    await source.ready;
     assert.equal(source.fresh, true);
     assert.deepEqual(source.heads, [{ name: 'main', oid: oidOf(c) }]);
     assert.deepEqual(source.tags, [{ name: 'v1', oid: OID }]);
     assert.deepEqual(source.view().commits.map((commit) => commit.oid), [oidOf(c), oidOf(b), OID]);
+  } finally {
+    globalThis.fetch = realFetch;
+    delete globalThis.document;
+  }
+});
+
+test('public freshen bridges a branch that moved further than the stub depth', async () => {
+  // main moved 20 commits past the snapshot — more than the shallow depth a
+  // branch outside the window gets. The gap is negotiated with `have`, so
+  // every new commit is spliced and the graph is fresh, not reverted.
+  const GAP = 20;
+  const chain = [];
+  let parent = OID;
+  for (let n = 1; n <= GAP; n++) {
+    const bytes = commitBytes({ parents: [parent], message: `new ${n}\n` });
+    chain.push(bytes);
+    parent = oidOf(bytes);
+  }
+  const tipOid = parent;
+  const realFetch = globalThis.fetch;
+  const bodies = [];
+  globalThis.document = {
+    querySelector: (selector) =>
+      selector.includes('repository_public') ? { content: 'true' } : null,
+  };
+  const inner = publicFreshenFetch({ snapshotOid: OID, headOid: tipOid, packObjects: chain });
+  globalThis.fetch = async (url, init = {}) => {
+    if (String(url).includes('.git/git-upload-pack') && String(init.body).includes('command=fetch')) {
+      bodies.push(String(init.body));
+    }
+    return inner(url, init);
+  };
+  try {
+    const source = await openRepoGraph('o', 'r');
+    await source.ready;
+    assert.equal(bodies.length, 1);
+    assert.ok(bodies[0].includes(`want ${tipOid}\n`));
+    assert.ok(bodies[0].includes(`have ${OID}\n`), 'a moved branch negotiates against its snapshot head');
+    assert.ok(bodies[0].includes('deepen 100\n'), 'the walk is bounded by the window, not the stub depth');
+    assert.equal(source.fresh, true);
+    assert.deepEqual(source.heads, [{ name: 'main', oid: tipOid }]);
+    const shown = source.view().commits.map((commit) => commit.oid);
+    assert.equal(shown.length, GAP + 1);
+    assert.equal(shown[0], tipOid);
+    assert.equal(shown.at(-1), OID);
   } finally {
     globalThis.fetch = realFetch;
     delete globalThis.document;
@@ -346,6 +534,7 @@ test('public freshen keeps the consistent snapshot when the pack leaves a gap', 
   globalThis.fetch = publicFreshenFetch({ snapshotOid: OID, headOid: oidOf(c), packObjects: [c] });
   try {
     const source = await openRepoGraph('o', 'r');
+    await source.ready;
     assert.equal(source.fresh, false);
     assert.deepEqual(source.heads, [{ name: 'main', oid: OID }]);
     // exact tags survive even when splicing is refused: they are ref data,
@@ -367,8 +556,182 @@ test('404 fails immediately without retries', async () => {
   };
   try {
     await assert.rejects(() => openRepoGraph('o', 'gone'), /No network-graph data/);
-    assert.equal(calls.length, 1);
+    assert.equal(calls.filter((c) => c.includes('/network/')).length, 1);
   } finally {
     globalThis.fetch = realFetch;
+  }
+});
+
+// --- branch selection ------------------------------------------------------
+// A branch whose tip is outside the loaded network window is no root, so
+// nothing of it used to be drawn — the bug this feature exists for. The tip
+// is materialised on demand, when the branch is selected.
+
+const FEAT_TIP = 'c'.repeat(40);
+
+function branchPickerFetch({ packObjects, featOid = FEAT_TIP, onFetchBody = () => {} }) {
+  return async (url, init = {}) => {
+    const path = String(url);
+    if (path.includes('/network/meta')) {
+      return jsonResponse({
+        nethash: 'h',
+        dates: ['2026-07-01'],
+        users: [{
+          name: 'o',
+          repo: 'r',
+          heads: [{ name: 'main', id: OID }, { name: 'feature', id: featOid }],
+        }],
+      });
+    }
+    if (path.includes('/network/chunk')) {
+      // The window holds main's tip only; feature's tip is older than the
+      // newest 100 entries of the network array and never lands in it.
+      return jsonResponse({
+        commits: [{ id: OID, parents: [], author: 'A D', login: 'ad', date: '2026-07-01 00:00:00', message: 'base' }],
+      });
+    }
+    if (path.includes('.git/git-upload-pack')) {
+      if (String(init.body).includes('command=ls-refs')) {
+        return new Response(
+          pkt(`${OID} HEAD symref-target:refs/heads/main\n`).toString() +
+            pkt(`${OID} refs/heads/main\n`).toString() +
+            pkt(`${featOid} refs/heads/feature\n`).toString() +
+            '0000',
+        );
+      }
+      onFetchBody(String(init.body));
+      return new Response(Buffer.concat([
+        pkt('packfile\n'),
+        pkt(Buffer.concat([Buffer.from([1]), packOf(packObjects)])),
+        Buffer.from('0000'),
+      ]));
+    }
+    throw new Error('unexpected url: ' + path);
+  };
+}
+
+const publicDocument = {
+  querySelector: (selector) =>
+    selector.includes('repository_public') ? { content: 'true' } : null,
+  querySelectorAll: () => [],
+};
+
+test('an unmerged branch outside the window is offered, drawn when selected', async () => {
+  const mid = commitBytes({ parents: [OID], message: 'feature work\n' });
+  const tip = commitBytes({ parents: [oidOf(mid)], message: 'feature tip\n' });
+  const realFetch = globalThis.fetch;
+  const bodies = [];
+  globalThis.document = publicDocument;
+  globalThis.fetch = branchPickerFetch({
+    packObjects: [mid, tip],
+    featOid: oidOf(tip),
+    onFetchBody: (body) => bodies.push(body),
+  });
+  try {
+    const source = await openRepoGraph('o', 'r');
+    await source.ready;
+
+    // Default: only what the window already holds, so no extra request.
+    assert.equal(source.defaultBranch, 'main');
+    assert.deepEqual([...source.selected], ['main']);
+    assert.deepEqual(source.branches, [
+      { name: 'main', oid: OID, loaded: true },
+      { name: 'feature', oid: oidOf(tip), loaded: false },
+    ]);
+    assert.equal(bodies.length, 0);
+    assert.deepEqual(source.view().commits.map((c) => c.oid), [OID]);
+
+    await source.selectBranches(['main', 'feature']);
+    assert.equal(bodies.length, 1);
+    // "have" would promise the server ancestors we do not hold; the window is
+    // a slice of the network array, not an ancestor-closed set.
+    assert.ok(!bodies[0].includes('have '), 'the fetch must not negotiate haves');
+    assert.ok(bodies[0].includes(`want ${oidOf(tip)}`));
+
+    assert.deepEqual(source.heads, [
+      { name: 'main', oid: OID },
+      { name: 'feature', oid: oidOf(tip) },
+    ]);
+    assert.deepEqual(source.truncated, []);
+    // Newest first, and the branch is spliced in above the base it forked from.
+    assert.deepEqual(source.view().commits.map((c) => c.oid), [oidOf(tip), oidOf(mid), OID]);
+    assert.equal(source.fresh, true);
+  } finally {
+    globalThis.fetch = realFetch;
+    delete globalThis.document;
+  }
+});
+
+test('a branch that reaches deeper than the fetch is drawn as a stub, not dropped', async () => {
+  // The pack carries the tip but not its parent: the branch forked further
+  // back than the fetch bound. It still gets a row, a chip and a dashed tail.
+  const tip = commitBytes({ parents: ['9'.repeat(40)], message: 'old branch tip\n' });
+  const realFetch = globalThis.fetch;
+  globalThis.document = publicDocument;
+  globalThis.fetch = branchPickerFetch({ packObjects: [tip], featOid: oidOf(tip) });
+  try {
+    const source = await openRepoGraph('o', 'r');
+    await source.ready;
+    await source.selectBranches(['main', 'feature']);
+    assert.deepEqual(source.truncated, ['feature']);
+    assert.deepEqual(source.view().commits.map((c) => c.oid), [oidOf(tip), OID]);
+    assert.deepEqual(source.heads.map((h) => h.name), ['main', 'feature']);
+  } finally {
+    globalThis.fetch = realFetch;
+    delete globalThis.document;
+  }
+});
+
+test('deselecting a branch removes its commits from the graph', async () => {
+  const side = commitBytes({ parents: [OID], message: 'side\n' });
+  const realFetch = globalThis.fetch;
+  globalThis.document = publicDocument;
+  const store = {};
+  globalThis.localStorage = {
+    getItem: (key) => (key in store ? store[key] : null),
+    setItem: (key, value) => {
+      store[key] = String(value);
+    },
+    removeItem: (key) => {
+      delete store[key];
+    },
+  };
+  globalThis.fetch = branchPickerFetch({ packObjects: [side], featOid: oidOf(side) });
+  try {
+    const source = await openRepoGraph('o', 'r');
+    await source.ready;
+    await source.selectBranches(['main', 'feature']);
+    assert.equal(source.view().commits.length, 2);
+
+    await source.selectBranches(['main']);
+    assert.deepEqual(source.view().commits.map((c) => c.oid), [OID]);
+    assert.deepEqual(source.heads, [{ name: 'main', oid: OID }]);
+    // and the choice is remembered for the next visit
+    assert.deepEqual(JSON.parse(store['ggt-branches'])['o/r'], ['main']);
+  } finally {
+    globalThis.fetch = realFetch;
+    delete globalThis.document;
+    delete globalThis.localStorage;
+  }
+});
+
+test('the default branch stays drawn, in lane 0, when only another branch is picked', async () => {
+  // `feature` is ahead of `main`; picking just `feature` must still draw
+  // `main`, and `main` (not the newer tip) owns the leftmost lane.
+  const side = commitBytes({ parents: [OID], message: 'side\n' });
+  const realFetch = globalThis.fetch;
+  globalThis.document = publicDocument;
+  globalThis.fetch = branchPickerFetch({ packObjects: [side], featOid: oidOf(side) });
+  try {
+    const source = await openRepoGraph('o', 'r');
+    await source.ready;
+    await source.selectBranches(['feature']);
+    assert.deepEqual(source.heads.map((h) => h.name).sort(), ['feature', 'main']);
+    assert.equal(source.pinnedOid, OID);
+    assert.ok(source.selected.has('main'));
+    assert.deepEqual(source.view().commits.map((c) => c.oid), [oidOf(side), OID]);
+  } finally {
+    globalThis.fetch = realFetch;
+    delete globalThis.document;
   }
 });

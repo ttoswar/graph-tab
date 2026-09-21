@@ -5,9 +5,9 @@
 // back/forward, and pasted links all land on the graph.
 
 import { ensureTab, markTabSelected, markTabDeselected, repoNav, TAB_ID } from './tab.js';
-import { openRepoGraph, privateFreshEnabled, setPrivateFreshEnabled } from './data.js';
+import { openRepoGraph } from './data.js';
 import { layout } from './layout.js';
-import { render, renderStatus } from './render.js';
+import { render, renderStatus, closeBranchPicker, markViewBusy, setUpdateProgress } from './render.js';
 import { maybeWelcome } from './welcome.js';
 
 const VIEW_ID = 'ggt-view';
@@ -42,6 +42,9 @@ function contentFrame() {
 }
 
 function closeGraphView() {
+  // The picker's menu lives on document.body, so it has to be taken down
+  // explicitly — removing the view would otherwise leave it floating.
+  closeBranchPicker();
   document.getElementById(VIEW_ID)?.remove();
   for (const element of hidden) {
     if (element.isConnected) element.style.removeProperty('display');
@@ -75,6 +78,11 @@ function openGraphView() {
   loadAndRender(view, repoRef);
 }
 
+// The live view element: GitHub re-renders can replace it mid-load.
+function currentView(fallback) {
+  return document.getElementById(VIEW_ID) || fallback;
+}
+
 async function loadAndRender(view, repoRef) {
   try {
     if (!source || source.owner !== repoRef.owner || source.repo !== repoRef.repo) {
@@ -82,12 +90,21 @@ async function loadAndRender(view, repoRef) {
         busy: true,
         detail: 'GitHub may need a moment to generate graph data for this repository.',
       });
-      source = await openRepoGraph(repoRef.owner, repoRef.repo, (count) =>
-        renderStatus(view, repoRef, `Fetching fresh commits… ${count}`, {
-          busy: true,
-          detail: 'One small request per missing commit; fetched commits are cached on this device.',
-        }),
-      );
+      // A private repo comes back while its missing commits are still being
+      // fetched: draw it now, count progress on the pill, redraw once ready.
+      // Progress only counts while this load is current and updating — not
+      // after Refresh or navigation replaced it, nor for later branch picks.
+      let loading = null;
+      loading = await openRepoGraph(repoRef.owner, repoRef.repo, (count) => {
+        if (loading && source === loading && loading.updating) setUpdateProgress(currentView(view), count);
+      });
+      source = loading;
+      if (loading.updating) {
+        rerender(view);
+        await loading.ready;
+        if (source !== loading) return; // superseded while updating
+        view = currentView(view); // GitHub may have rebuilt it meanwhile
+      }
     }
     rerender(view);
     maybeWelcome();
@@ -103,7 +120,7 @@ async function loadAndRender(view, repoRef) {
 function rerender(view) {
   const { commits, filtered } = source.view();
   // Reloading via a fresh source re-fetches meta (new nethash) and re-runs
-  // freshen(); used by both the Refresh button and the opt-in toggle.
+  // freshen(); used by the Refresh button.
   const reload = () => {
     const repoRef = { owner: source.owner, repo: source.repo };
     source = null;
@@ -113,12 +130,16 @@ function rerender(view) {
     owner: source.owner,
     repo: source.repo,
     commits,
-    graph: layout(commits),
+    graph: layout(commits, { pinnedOid: source.pinnedOid }),
     heads: source.heads,
+    branches: source.branches,
+    selected: source.selected,
+    defaultBranch: source.defaultBranch,
+    truncated: source.truncated,
+    canFetch: source.canFetch,
     tags: source.tags,
     fresh: source.fresh,
-    private: source.private,
-    privateFresh: privateFreshEnabled(),
+    updating: source.updating,
     filtered,
     total: source.total,
     loaded: source.loaded(),
@@ -127,12 +148,16 @@ function rerender(view) {
     hasMore: source.hasMore(),
     onRefresh: reload,
     onLoadOlder: async () => {
+      markViewBusy(view);
       await source.loadOlder();
       rerender(view);
     },
-    onToggleFresh: (on) => {
-      setPrivateFreshEnabled(on);
-      reload();
+    // Adding branches only ever adds commits, so the loaded window survives:
+    // no meta/chunk refetch, just the pull for the newly ticked branches.
+    onSelectBranches: async (names) => {
+      markViewBusy(view);
+      await source.selectBranches(names);
+      rerender(view);
     },
   });
 }

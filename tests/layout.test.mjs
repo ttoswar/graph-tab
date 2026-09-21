@@ -92,3 +92,82 @@ test('empty input', () => {
   const g = layout([]);
   assert.deepEqual(g, { nodes: [], segments: [], laneCount: 0 });
 });
+
+test('the pinned branch owns lane 0 even when another branch is newer', () => {
+  // `topic` is the newest row, so without pinning it would take lane 0 and
+  // the default branch would be pushed right.
+  const commits = [
+    { oid: 'topic', parents: ['base'] },
+    { oid: 'main', parents: ['base'] },
+    { oid: 'base', parents: [] },
+  ];
+  const plain = layout(commits);
+  assert.deepEqual(plain.nodes.map((n) => n.x), [0, 1, 0]);
+
+  const pinned = layout(commits, { pinnedOid: 'main' });
+  assert.deepEqual(pinned.nodes.map((n) => n.x), [1, 0, 0]);
+  // The reserved lane draws nothing above its own commit: no line may appear
+  // in lane 0 on the `topic` row, which sits above `main`.
+  const above = pinned.segments.filter((s) => s.y1 < 1 && (s.x1 === 0 || s.x2 === 0));
+  assert.deepEqual(above, []);
+});
+
+test('lane 0 is not handed to another branch after the pinned history ends', () => {
+  const commits = [
+    { oid: 'main', parents: ['root'] },
+    { oid: 'root', parents: [] },
+    { oid: 'orphan', parents: [] }, // unrelated history below, no common base
+  ];
+  const { nodes } = layout(commits, { pinnedOid: 'main' });
+  assert.deepEqual(nodes.map((n) => n.x), [0, 0, 1]);
+});
+
+test('an unknown pinned oid changes nothing', () => {
+  const commits = [{ oid: 'a', parents: [] }];
+  assert.deepEqual(
+    layout(commits, { pinnedOid: 'nope' }).nodes,
+    layout(commits).nodes,
+  );
+});
+
+test('a merge into the pinned branch keeps its edge until the pinned row', () => {
+  // feature merged main (P) in, then two more feature commits landed, so the
+  // pinned tip P sits several rows below the merge M. The merge edge must
+  // run all the way down into P, not stop one row under M.
+  const commits = [
+    { oid: 'M', parents: ['F2', 'P'] },
+    { oid: 'F2', parents: ['F1'] },
+    { oid: 'F1', parents: ['P0'] },
+    { oid: 'P', parents: ['P0'] },
+    { oid: 'P0', parents: [] },
+  ];
+  const g = layout(commits, { pinnedOid: 'P' });
+  assert.deepEqual(g.nodes.map((n) => n.x), [1, 1, 1, 0, 0]);
+  // Nothing may touch lane 0 above P's row (3): the reserved lane is silent.
+  const above = g.segments.filter((s) => s.y2 <= 3 && s.y1 < 3 && (s.x1 === 0 || s.x2 === 0) && !(s.y2 === 3 && s.x2 === 0));
+  assert.deepEqual(above, []);
+  // The merge edge leaves M into a lane of its own and comes into P from it.
+  const merge = g.segments.find((s) => s.y1 === 0 && s.x1 === 1 && s.x2 === 2);
+  assert.ok(merge, 'merge edge should open its own lane');
+  assert.ok(g.segments.some((s) => s.y2 === 3 && s.x2 === 0 && s.x1 === 2 && s.color === merge.color), 'merge lane must bend into P');
+  // Every row between M and P is covered by that lane: no gap.
+  for (let row = 1; row < 3; row++) {
+    assert.ok(g.segments.some((s) => s.color === merge.color && s.y1 <= row && s.y2 >= row + 1), `merge lane missing at row ${row}`);
+  }
+});
+
+test('two merges into the pinned branch share one lane', () => {
+  const commits = [
+    { oid: 'M2', parents: ['F3', 'P'] },
+    { oid: 'F3', parents: ['M1'] },
+    { oid: 'M1', parents: ['F1', 'P'] },
+    { oid: 'F1', parents: ['P0'] },
+    { oid: 'P', parents: ['P0'] },
+    { oid: 'P0', parents: [] },
+  ];
+  const g = layout(commits, { pinnedOid: 'P' });
+  assert.deepEqual(g.nodes.map((n) => n.x), [1, 1, 1, 1, 0, 0]);
+  // M2 opens lane 2 for P; M1 joins it rather than opening lane 3.
+  assert.equal(g.laneCount, 3);
+  assert.ok(g.segments.some((s) => s.y1 === 2 && s.x1 === 1 && s.x2 === 2), 'M1 should join the open lane');
+});

@@ -61,6 +61,7 @@
 /* The GitHub-style framed box: muted toolbar (title + counts subtitle +
    actions), optional banners, the graph, and a muted pagination footer. */
 .ggt-shell {
+  position: relative;
   border: 1px solid var(--borderColor-default, #d1d9e0);
   border-radius: 6px;
   overflow: hidden;
@@ -93,17 +94,22 @@
   flex-wrap: wrap;
   gap: 10px;
 }
+/* Primer's medium button: 32px tall, 12px side padding, 14px label. The
+   graph sits inside GitHub's chrome, so its buttons have to line up with the
+   ones GitHub renders right next to them. */
 .ggt-btn {
-  padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 32px;
+  padding: 0 12px;
   font: inherit;
-  font-size: 12px;
+  font-size: 14px;
   font-weight: 500;
-  line-height: 26px;
-  color: var(--button-default-fgColor-rest, #24292f);
+  color: var(--button-default-fgColor-rest, #25292e);
   background: var(--button-default-bgColor-rest, #f6f8fa);
-  border: 1px solid var(--button-default-borderColor-rest, #d0d7de);
+  border: 1px solid var(--button-default-borderColor-rest, #d1d9e0);
   border-radius: 6px;
-  box-shadow: 0 1px 0 rgba(31, 35, 40, 0.04);
   cursor: pointer;
 }
 .ggt-btn:hover:enabled {
@@ -113,8 +119,7 @@
   cursor: default;
   opacity: 0.65;
 }
-.ggt-btn:focus-visible,
-.ggt-fresh input:focus-visible {
+.ggt-btn:focus-visible {
   outline: 2px solid var(--focus-outlineColor, #0969da);
   outline-offset: 2px;
 }
@@ -131,27 +136,6 @@
   color: var(--fgColor-success, #1a7f37);
   background: var(--bgColor-success-muted, rgba(46, 160, 67, 0.15));
 }
-.ggt-banner {
-  padding: 8px 16px;
-  font-size: 12px;
-  background: var(--bgColor-attention-muted, #fff8c5);
-  border-bottom: 1px solid var(--borderColor-default, #d1d9e0);
-}
-.ggt-banner-error {
-  color: var(--fgColor-danger, #d1242f);
-  background: var(--bgColor-danger-muted, #ffebe9);
-}
-.ggt-fresh {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  font-size: 12px;
-  color: var(--fgColor-muted, #59636e);
-  white-space: nowrap;
-  cursor: pointer;
-  user-select: none;
-}
-
 /* Column widths are --ggt-col-* variables set by columns.js; the header
    dividers drag them live. Grips sit on the column boundaries: author/date/
    sha are right-anchored (message flexes), so grips position from the right
@@ -247,7 +231,7 @@
   flex: none;
 }
 .ggt-ref {
-  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+  font-family: var(--fontStack-sansSerif, 'Mona Sans VF', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji');
   font-size: 11px;
   line-height: 16px;
   padding: 0 7px;
@@ -318,7 +302,7 @@ a.ggt-author:hover {
   flex: none;
   width: var(--ggt-col-sha, 64px);
   text-align: right;
-  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+  font-family: var(--fontStack-monospace, ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace);
   font-size: 12px;
   color: var(--fgColor-muted, #59636e);
   text-decoration: none;
@@ -456,3 +440,5 @@ a.ggt-author:hover {
 .ggt-welcome-btn:hover {
   background: var(--button-primary-bgColor-hover, #1c8139);
 }
+
+
